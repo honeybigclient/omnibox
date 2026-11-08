@@ -11,6 +11,8 @@ import SimplePlayerPage from "./pages/simple-player-page.tsx";
 import HistoryPage from "./pages/history-page.tsx";
 import OnlinePlayerPage from "./pages/online-player-page.tsx";
 import AISpeedTestPage from "./pages/ai-speed-test-page.tsx";
+import AdminPage from "./pages/admin-page.tsx";
+import { refreshRemoteApiSites } from "@/config/remoteSources";
 
 const router = createHashRouter([
   {
@@ -45,9 +47,18 @@ const router = createHashRouter([
         path: "ai-speed-test",
         element: <AISpeedTestPage />,
       },
+      {
+        path: "admin",
+        element: <AdminPage />,
+      },
     ],
   },
 ]);
+
+// 后台刷新上游远程源，不阻塞首屏渲染
+refreshRemoteApiSites().catch((error) => {
+  console.warn("刷新远程采集站失败:", error);
+});
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
