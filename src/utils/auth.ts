@@ -1,3 +1,4 @@
+import { API_SITES } from "@/config/apiSites";
 import type { ApiSite } from "@/types/apiSite";
 
 export interface Me {
@@ -8,6 +9,53 @@ export interface Me {
 }
 
 let cached: Me | null = null;
+const BUILTIN_KEYS = new Set(API_SITES.map((site) => site.key));
+
+async function syncAllowedSources() {
+  try {
+    const response = await fetch("/api/sources", { cache: "no-store" });
+    if (!response.ok) return;
+
+    const data = await response.json();
+    const extras = (Array.isArray(data.sources) ? data.sources : [])
+      .filter(
+        (site: ApiSite) =>
+          site?.key &&
+          site?.api &&
+          !BUILTIN_KEYS.has(site.key)
+      )
+      .map((site: ApiSite) => ({
+        key: site.key,
+        name: String(site.name || site.key),
+        api: site.api,
+        isCustom: true,
+      }));
+
+    let existing: ApiSite[] = [];
+    try {
+      const parsed = JSON.parse(localStorage.getItem("customApiSites") || "[]");
+      if (Array.isArray(parsed)) existing = parsed;
+    } catch {
+      existing = [];
+    }
+
+    const extraKeys = new Set<string>(extras.map((site: ApiSite) => site.key));
+    const kept = existing.filter(
+      (site) =>
+        site?.key &&
+        !String(site.key).startsWith("remote_") &&
+        site.key !== "huangguo" &&
+        !extraKeys.has(site.key)
+    );
+
+    localStorage.setItem(
+      "customApiSites",
+      JSON.stringify([...kept, ...extras])
+    );
+  } catch {
+    // 保留浏览器里已有的源
+  }
+}
 
 export async function loadMe(): Promise<Me | null> {
   try {
@@ -20,6 +68,7 @@ export async function loadMe(): Promise<Me | null> {
       approved: data.approved === true,
       sources: Array.isArray(data.sources) ? data.sources : [],
     };
+    await syncAllowedSources();
     return cached;
   } catch {
     return null;
