@@ -39,10 +39,10 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({ open, onOpenChange }) =
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="overflow-hidden p-0 md:max-h-[650px] md:max-w-[700px] lg:max-w-[1000px] z-70">
+      <DialogContent className="max-h-[calc(100dvh-1rem)] w-[calc(100vw-1rem)] max-w-[calc(100vw-1rem)] overflow-hidden p-0 md:max-h-[650px] md:max-w-[700px] lg:max-w-[1000px] z-70">
         <DialogTitle className="sr-only">Settings</DialogTitle>
         <DialogDescription className="sr-only">Customize your settings here.</DialogDescription>
-        <SidebarProvider className="items-start">
+        <SidebarProvider className="min-h-0 w-full items-start">
           {/* 桌面端侧边栏 */}
           <Sidebar collapsible="none" className="hidden md:flex border">
             <SidebarContent>
@@ -65,8 +65,8 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({ open, onOpenChange }) =
             </SidebarContent>
           </Sidebar>
 
-          <main className="flex flex-1 flex-col overflow-hidden">
-            <header className="flex h-16 shrink-0 items-center gap-2 transition-[width,height] border-b ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12 px-4">
+          <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+            <header className="flex h-14 shrink-0 items-center gap-2 border-b px-3 transition-[width,height] ease-linear group-has-[[data-collapsible=icon]]/sidebar-wrapper:h-12 md:h-16 md:px-4">
               <div className="flex items-center gap-2">
                 {/* 移动端汉堡包菜单 */}
                 <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
@@ -105,7 +105,7 @@ const SettingsDialog: React.FC<SettingsDialogProps> = ({ open, onOpenChange }) =
               </div>
             </header>
 
-            <ScrollArea className="h-[calc(100vh-4rem)] md:h-[580px] p-4">
+            <ScrollArea className="h-[calc(100dvh-5.5rem)] w-full min-w-0 p-3 md:h-[580px] md:p-4">
              {activeKey === "appearance" && <AppearanceSettings />} 
               {activeKey === "proxy" && <ProxySettings />}
               {activeKey === "site" && <ApiSitesList />}
