@@ -62,6 +62,56 @@ async function getConfig() {
   return configCache;
 }
 
+function getEmail(request) {
+  const header = request.headers.get("Cf-Access-Authenticated-User-Email");
+  if (header) return header.trim().toLowerCase();
+
+  const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!jwt) return "";
+  try {
+    const payload = jwt.split(".")[1];
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    return String(JSON.parse(atob(normalized)).email || "").trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function adminEmails(env) {
+  return String(env.ADMIN_EMAIL || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function checkAccess(request, env) {
+  const email = getEmail(request);
+  if (!email) return { ok: false, status: 401, error: "未登录" };
+  if (adminEmails(env).includes(email)) return { ok: true };
+
+  if (!env.USERS_KV) {
+    return { ok: false, status: 500, error: "USERS_KV 未绑定" };
+  }
+
+  let user = null;
+  try {
+    user = JSON.parse((await env.USERS_KV.get(email)) || "null");
+  } catch {
+    user = null;
+  }
+
+  if (!user || user.approved === false) {
+    return { ok: false, status: 403, error: "账号未获批准" };
+  }
+
+  const allowed = Array.isArray(user.sources) ? user.sources : [];
+  if (!allowed.includes("huangguo")) {
+    return { ok: false, status: 403, error: "没有黄果短剧权限" };
+  }
+
+  return { ok: true };
+}
+
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -274,11 +324,16 @@ async function homeList(typeId, page, config, origin) {
 }
 
 export async function onRequest(context) {
-  const { request } = context;
+  const { request, env } = context;
   const url = new URL(request.url);
 
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS });
+  }
+
+  const access = await checkAccess(request, env);
+  if (!access.ok) {
+    return jsonResponse({ error: access.error }, access.status);
   }
 
   if (typeof context.waitUntil === "function") {
