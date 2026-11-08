@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { API_SITES } from "@/config/apiSites";
-import { getSelectedApiSites } from "@/utils/apiSite";
+import { isAllowedSource } from "@/utils/auth";
 import { Movie, ApiSite } from "@/types/index";
 import { RouterUtils } from "@/utils/router";
 import { fetchWithProxy } from "@/utils/proxy";
@@ -119,6 +119,46 @@ const getPlatformByUrl = (url: string): string => {
   }
 };
 
+function normalizeTitle(value: string): string {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]/gu, "");
+}
+
+function buildSearchUrl(api: string, keyword: string): string {
+  const base = api.trim().replace(/\/+$/, "").replace(/[?&]+$/, "");
+  const fullEndpoint =
+    /\.php$/i.test(base) ||
+    /\/api\/json$/i.test(base) ||
+    /\/provide\/vod$/i.test(base);
+  const query = `ac=videolist&wd=${encodeURIComponent(keyword)}`;
+  return fullEndpoint
+    ? `${base}${base.includes("?") ? "&" : "?"}${query}`
+    : `${base}/api.php/provide/vod/?${query}`;
+}
+
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  task: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (true) {
+      const current = index++;
+      if (current >= items.length) return;
+      results[current] = await task(items[current]);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, () => worker())
+  );
+  return results;
+}
+
 export default function SearchResultsPage() {
   const [searchParams] = useSearchParams();
   const [movieResults, setMovieResults] = useState<MovieResult[]>([]);
@@ -131,6 +171,14 @@ export default function SearchResultsPage() {
   const [isCloudLoading, setIsCloudLoading] = useState(false);
   const [selectedPlatform, setSelectedPlatform] = useState<string>("all");
   const [platformCounts, setPlatformCounts] = useState<Record<string, number>>({});
+
+  const normalizedSearchQuery = normalizeTitle(searchQuery);
+  const exactMovies = movieResults.filter(
+    (movie) => normalizeTitle(movie.title) === normalizedSearchQuery
+  );
+  const fuzzyMovies = movieResults.filter(
+    (movie) => normalizeTitle(movie.title) !== normalizedSearchQuery
+  );
 
   // 获取选中的AI模型配置
   const getSelectedAIModel = () => {
@@ -410,45 +458,63 @@ export default function SearchResultsPage() {
     setIsLoading(true);
 
     try {
-      // 获取所有启用的资源站
-      const selectedKeys = getSelectedApiSites();
-      const defaultSites = API_SITES.filter((site) => selectedKeys.includes(site.key));
-      const customSites = JSON.parse(localStorage.getItem("customApiSites") || "[]") as ApiSite[];
-      const selectedCustomSites = customSites.filter((site) => selectedKeys.includes(site.key));
-      const allSites = [...defaultSites, ...selectedCustomSites];
-
-      // 并行搜索所有站点
-      const searchResults = await Promise.all(
-        allSites.map(async (site) => {
-          try {
-            const targetUrl = `${site.api}/api.php/provide/vod/?ac=videolist&wd=${encodeURIComponent(query)}`;
-            const response = await fetchWithProxy(targetUrl);
-            if (!response.ok) return [];
-            const data = await response.json();
-            if (data.code === 1 && data.list) {
-              return data.list.map((item: Movie) => ({
-                id: item.vod_id,
-                title: item.vod_name,
-                poster: item.vod_pic,
-                source: site.name,
-                source_key: site.key,
-                vod_remarks: item.vod_remarks,
-                type: item.type_name || "未知",
-                year: item.vod_year || "未知",
-                region: item.vod_area || "未知",
-                rate: item.vod_score,
-              }));
-            }
-            return [];
-          } catch (error) {
-            console.error(`Error searching in site ${site.name}:`, error);
-            return [];
-          }
-        })
+      // 搜索所有有权限的源，而不只是当前勾选的源
+      const defaultSites = API_SITES.filter((site) => isAllowedSource(site.key));
+      const customSites = JSON.parse(
+        localStorage.getItem("customApiSites") || "[]"
+      ) as ApiSite[];
+      const allowedCustomSites = customSites.filter(
+        (site) => site?.key && site?.api && isAllowedSource(site.key)
       );
 
-      // 合并所有搜索结果
+      const seen = new Set<string>();
+      const allSites = [...defaultSites, ...allowedCustomSites].filter((site) => {
+        const key = site.api.replace(/\/+$/, "");
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      // 控制并发，避免几十个源同时请求
+      const searchResults = await mapLimit(allSites, 8, async (site) => {
+        try {
+          const targetUrl = buildSearchUrl(site.api, query);
+          const response = await Promise.race([
+            fetchWithProxy(targetUrl),
+            new Promise<never>((_, reject) =>
+              setTimeout(() => reject(new Error("搜索超时")), 10000)
+            ),
+          ]);
+          if (!response.ok) return [];
+          const data = await response.json();
+          if (data.code === 1 && Array.isArray(data.list)) {
+            return data.list.map((item: Movie) => ({
+              id: item.vod_id,
+              title: item.vod_name,
+              poster: item.vod_pic,
+              source: site.name,
+              source_key: site.key,
+              vod_remarks: item.vod_remarks,
+              type: item.type_name || "未知",
+              year: item.vod_year || "未知",
+              region: item.vod_area || "未知",
+              rate: item.vod_score,
+            }));
+          }
+          return [];
+        } catch (error) {
+          console.error(`Error searching in site ${site.name}:`, error);
+          return [];
+        }
+      });
+
       const allResults = searchResults.flat();
+      const normalizedQuery = normalizeTitle(query);
+      allResults.sort((a, b) => {
+        const aExact = normalizeTitle(a.title) === normalizedQuery ? 0 : 1;
+        const bExact = normalizeTitle(b.title) === normalizedQuery ? 0 : 1;
+        return aExact - bExact;
+      });
       setMovieResults(allResults);
     } catch (error) {
       console.error("Error fetching search results:", error);
@@ -556,6 +622,57 @@ export default function SearchResultsPage() {
     e.currentTarget.src = noImg;
   };
 
+  const renderMovieCard = (movie: MovieResult) => (
+    <Card
+      key={`${movie.source_key}-${movie.id}`}
+      onClick={() => handleCardClick(movie)}
+      className="gap-0 py-0 overflow-hidden hover:shadow-lg transition-all duration-300 border-border/50 hover:border-border bg-card/50 hover:bg-card">
+      <div className="relative w-full h-48">
+        <img
+          src={movie.poster || noImg}
+          alt={movie.title}
+          className="absolute inset-0 w-full h-full object-cover"
+          referrerPolicy="no-referrer"
+          onError={handleImageError}
+        />
+        {movie.rate && (
+          <div className="absolute top-2 right-2">
+            <Badge variant="secondary" className="bg-black/70 text-white text-xs border-0">
+              <Star className="w-3 h-3 mr-1 fill-yellow-400 text-yellow-400" />
+              {movie.rate}
+            </Badge>
+          </div>
+        )}
+        <div className="absolute bottom-2 left-2">
+          <Badge variant="outline" className="bg-black/70 text-white border-white/30 text-xs">
+            {movie.vod_remarks}
+          </Badge>
+        </div>
+        <div className="absolute bottom-2 right-2">
+          <Badge variant="outline" className="bg-black/70 text-white border-white/30 text-xs">
+            {movie.source}
+          </Badge>
+        </div>
+      </div>
+      <CardContent className="p-3">
+        <h3 className="font-medium text-sm line-clamp-2 mb-2">{movie.title}</h3>
+        <div className="flex items-center gap-1 mb-2 text-xs text-muted-foreground">
+          <Badge variant="outline" className="text-xs border-border/50">
+            {movie.type}
+          </Badge>
+          <span>{movie.year}</span>
+          <span>{movie.region}</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderMovieGrid = (movies: MovieResult[]) => (
+    <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
+      {movies.map(renderMovieCard)}
+    </div>
+  );
+
   return (
     <div className="min-h-screen bg-background">
       <div className="container mx-auto px-4 py-8">
@@ -586,56 +703,23 @@ export default function SearchResultsPage() {
                   <span>正在搜索影视作品...</span>
                 </div>
               ) : (
-                <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-                  {movieResults.map((movie) => (
-                    <Card
-                      key={movie.id}
-                      onClick={() => handleCardClick(movie)}
-                      className="gap-0 py-0 overflow-hidden hover:shadow-lg transition-all duration-300 border-border/50 hover:border-border bg-card/50 hover:bg-card">
-                      <div className="relative w-full h-48">
-                        <img
-                          src={movie.poster || noImg}
-                          alt={movie.title}
-                          className="absolute inset-0 w-full h-full object-cover"
-                          referrerPolicy="no-referrer"
-                          onError={handleImageError}
-                        />
-                        {movie.rate && (
-                          <div className="absolute top-2 right-2">
-                            <Badge variant="secondary" className="bg-black/70 text-white text-xs border-0">
-                              <Star className="w-3 h-3 mr-1 fill-yellow-400 text-yellow-400" />
-                              {movie.rate}
-                            </Badge>
-                          </div>
-                        )}
-                        <div className="absolute bottom-2 left-2">
-                          <Badge variant="outline" className="bg-black/70 text-white border-white/30 text-xs">
-                            {movie.vod_remarks}
-                          </Badge>
-                        </div>
-                        {/* 采集站 */}
-                        <div className="absolute bottom-2 right-2">
-                          <Badge variant="outline" className="bg-black/70 text-white border-white/30 text-xs">
-                            {movie.source}
-                          </Badge>
-                        </div>
-                      </div>
-                      <CardContent className="p-3">
-                        <h3 className="font-medium text-sm line-clamp-2 mb-2">{movie.title}</h3>
-                        <div className="flex items-center gap-1 mb-2 text-xs text-muted-foreground">
-                          <Badge variant="outline" className="text-xs border-border/50">
-                            {movie.type}
-                          </Badge>
-                          <span>{movie.year}</span>
-                          <span>{movie.region}</span>
-                        </div>
-                        {/* <Button size="sm" className="w-full h-8 text-xs" onClick={() => handleCardClick(movie)}>
-                          <Play className="w-3 h-3 mr-1" />
-                          在线观看
-                        </Button> */}
-                      </CardContent>
-                    </Card>
-                  ))}
+                <div className="space-y-8">
+                  {exactMovies.length > 0 && (
+                    <section>
+                      <h2 className="mb-3 text-lg font-semibold">
+                        精确匹配 ({exactMovies.length})
+                      </h2>
+                      {renderMovieGrid(exactMovies)}
+                    </section>
+                  )}
+                  {fuzzyMovies.length > 0 && (
+                    <section>
+                      <h2 className="mb-3 text-lg font-semibold">
+                        {exactMovies.length > 0 ? "相关结果" : "搜索结果"} ({fuzzyMovies.length})
+                      </h2>
+                      {renderMovieGrid(fuzzyMovies)}
+                    </section>
+                  )}
                 </div>
               )}
             </TabsContent>
