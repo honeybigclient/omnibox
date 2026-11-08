@@ -86,11 +86,31 @@ export default function AdminPage() {
     apiJson("/api/me")
       .then((data: Me) => {
         setMe(data);
-        if (data.isAdmin) loadUsers();
+        if (data.isAdmin) {
+          syncCatalog();
+          loadUsers();
+        }
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }, []);
+
+  async function syncCatalog() {
+    try {
+      await apiJson("/api/admin/catalog", {
+        method: "POST",
+        body: JSON.stringify({
+          sources: sources.map((site) => ({
+            key: site.key,
+            name: site.name,
+            api: site.api,
+          })),
+        }),
+      });
+    } catch (e) {
+      console.warn("同步源目录失败:", e);
+    }
+  }
 
   async function loadUsers() {
     try {
