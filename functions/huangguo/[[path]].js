@@ -91,7 +91,12 @@ function toVod(item, config, wrapPic = false, origin = "") {
   let pic = wrapPic
     ? picOf(config, item.vod_pic || item.cover)
     : String(item.vod_pic || item.cover || "");
-  // 封面也走同域代理，避免浏览器直接访问被墙的 workers.dev
+
+  // Worker 的列表接口有时返回 /media?url=... 这种相对路径，
+  // 先补成 Worker 绝对地址，再统一走本站图片代理。
+  if (pic && !/^https?:\/\//i.test(pic)) {
+    pic = `${config.api}${pic.startsWith("/") ? "" : "/"}${pic}`;
+  }
   if (pic && origin) {
     pic = `${origin}/huangguo/media?src=${encodeURIComponent(pic)}`;
   }
@@ -245,7 +250,7 @@ const HUANGGUO_CLASSES = [
   { type_id: "rank:potential", type_name: "潜力榜" },
 ];
 
-async function homeList(typeId, page, config) {
+async function homeList(typeId, page, config, origin) {
   const type = typeId || "ai-duanju";
   let url = `${config.api}/api/category/${encodeURIComponent(type)}?page=${page}&size=50&sort=latest`;
 
@@ -259,7 +264,7 @@ async function homeList(typeId, page, config) {
 
   try {
     const data = await fetchJson(url, `${config.site}/`);
-    const list = Array.isArray(data?.list) ? data.list.map((item) => toVod(item, config)) : [];
+    const list = Array.isArray(data?.list) ? data.list.map((item) => toVod(item, config, false, origin)) : [];
     const pageCount = Number(data?.pagecount) || page;
     return { list, pageCount };
   } catch (error) {
@@ -331,7 +336,7 @@ export async function onRequest(context) {
 
     const page = Math.max(1, Number(url.searchParams.get("pg")) || 1);
     const typeId = url.searchParams.get("t") || "ai-duanju";
-    const home = await homeList(typeId, page, config);
+    const home = await homeList(typeId, page, config, url.origin);
     return jsonResponse({
       code: 1,
       msg: "数据列表",
