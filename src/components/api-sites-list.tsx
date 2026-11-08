@@ -12,6 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { fetchWithProxy } from "@/utils/proxy";
+import { isAdmin, isAllowedSource } from "@/utils/auth";
 
 interface ApiSiteStatus {
   key: string;
@@ -37,9 +38,11 @@ const ApiSitesList: React.FC = () => {
     const selectedKeys = getSelectedApiSites();
     const testResults: ApiSiteStatus[] = [];
 
+    const admin = isAdmin();
+
     // 测试默认API站点
     await Promise.all(
-      API_SITES.map(async (site) => {
+      API_SITES.filter((site) => admin || isAllowedSource(site.key)).map(async (site) => {
         const targetUrl = `${site.api}/api.php/provide/vod/?ac=detail&wd=${encodeURIComponent("仙逆")}`;
     
         const startTime = performance.now();
@@ -73,7 +76,9 @@ const ApiSitesList: React.FC = () => {
     try {
       const customSites = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
       await Promise.all(
-        customSites.map(async (site: ApiSite) => {
+        customSites
+          .filter((site: ApiSite) => admin || isAllowedSource(site.key))
+          .map(async (site: ApiSite) => {
           const targetUrl = `${site.api}/api.php/provide/vod/?ac=detail&wd=${encodeURIComponent("仙逆")}`;
           const startTime = performance.now();
           try {
@@ -173,6 +178,10 @@ const ApiSitesList: React.FC = () => {
   };
 
   const handleAddSite = async () => {
+    if (!isAdmin()) {
+      setError("只有管理员可以添加源");
+      return;
+    }
     if (!newSite.name.trim() || !newSite.api.trim()) {
       setError("请填写完整的站点信息");
       return;
@@ -211,6 +220,7 @@ const ApiSitesList: React.FC = () => {
   };
 
   const handleDeleteSite = (key: string) => {
+    if (!isAdmin()) return;
     const customSites = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
     const updatedSites = customSites.filter((site: ApiSite) => site.key !== key);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(updatedSites));
@@ -259,18 +269,20 @@ const ApiSitesList: React.FC = () => {
               </Tooltip>
             </TooltipProvider>
 
-            <TooltipProvider>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button variant="outline" size="icon" onClick={() => setIsAdding(true)} className="h-8 w-8">
-                    <Plus className="h-4 w-4" />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent className="z-[70]">
-                  <p>添加站点</p>
-                </TooltipContent>
-              </Tooltip>
-            </TooltipProvider>
+            {isAdmin() && (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="outline" size="icon" onClick={() => setIsAdding(true)} className="h-8 w-8">
+                      <Plus className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent className="z-[70]">
+                    <p>添加站点</p>
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
           </div>
         </div>
 
@@ -297,7 +309,7 @@ const ApiSitesList: React.FC = () => {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className={`text-xs px-2 py-1 rounded-full ${getResponseTimeColor(site.responseTime)}`}>{formatResponseTime(site.responseTime)}</span>
-                    {site.isCustom && (
+                    {site.isCustom && isAdmin() && (
                       <TooltipProvider>
                         <Tooltip>
                           <TooltipTrigger asChild>
