@@ -14,8 +14,100 @@ const json = (data, status = 200) =>
 const isDoubanHost = (hostname) =>
   /(^|\.)doubanio\.com$/i.test(hostname) || /(^|\.)douban\.com$/i.test(hostname);
 
+function getEmail(request) {
+  const header = request.headers.get("Cf-Access-Authenticated-User-Email");
+  if (header) return header.trim().toLowerCase();
+
+  const jwt = request.headers.get("Cf-Access-Jwt-Assertion");
+  if (!jwt) return "";
+  try {
+    const payload = jwt.split(".")[1];
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    return String(JSON.parse(atob(normalized)).email || "").trim().toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function adminEmails(env) {
+  return String(env.ADMIN_EMAIL || "")
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function findSource(catalog, targetUrl) {
+  let best = null;
+  const target = targetUrl.href;
+
+  for (const source of Array.isArray(catalog) ? catalog : []) {
+    if (!source?.key || typeof source.api !== "string") continue;
+    const base = source.api.trim().replace(/\/+$/, "");
+    if (!/^https?:\/\//i.test(base)) continue;
+    if (
+      target === base ||
+      target.startsWith(`${base}/`) ||
+      target.startsWith(`${base}?`)
+    ) {
+      if (!best || base.length > best.base.length) {
+        best = { key: source.key, base };
+      }
+    }
+  }
+
+  return best;
+}
+
+async function checkAccess(request, env, targetUrl) {
+  const email = getEmail(request);
+  if (!email) return { error: json({ error: "未登录" }, 401) };
+
+  if (adminEmails(env).includes(email)) return { email, admin: true };
+
+  if (!env.USERS_KV) {
+    return { error: json({ error: "USERS_KV 未绑定" }, 500) };
+  }
+
+  let user = null;
+  try {
+    user = JSON.parse((await env.USERS_KV.get(email)) || "null");
+  } catch {
+    user = null;
+  }
+  if (!user || user.approved === false) {
+    return { error: json({ error: "账号未获批准" }, 403) };
+  }
+
+  // 豆瓣首页/封面不属于采集站权限范围，登录用户即可看
+  if (
+    targetUrl.hostname === "movie.douban.com" ||
+    isDoubanHost(targetUrl.hostname)
+  ) {
+    return { email, admin: false };
+  }
+
+  let catalog = [];
+  try {
+    catalog = JSON.parse((await env.USERS_KV.get("catalog")) || "[]");
+  } catch {
+    catalog = [];
+  }
+
+  const matched = findSource(catalog, targetUrl);
+  if (!matched) {
+    return { error: json({ error: "该源未登记，请联系管理员" }, 403) };
+  }
+
+  const allowed = Array.isArray(user.sources) ? user.sources : [];
+  if (!allowed.includes(matched.key)) {
+    return { error: json({ error: "没有该源权限" }, 403) };
+  }
+
+  return { email, admin: false };
+}
+
 export async function onRequest(context) {
-  const { request } = context;
+  const { request, env } = context;
   const url = new URL(request.url);
 
   if (request.method === "OPTIONS") {
@@ -44,6 +136,9 @@ export async function onRequest(context) {
   } catch {
     return json({ error: "Invalid target URL", targetUrl: target }, 400);
   }
+
+  const access = await checkAccess(request, env, targetUrl);
+  if (access.error) return access.error;
 
   try {
     const headers = new Headers();
