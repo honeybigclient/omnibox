@@ -191,7 +191,11 @@ async function buildDetail(id, config, origin) {
   const resolved = await mapLimit(episodes, 8, async (ep, index) => {
     const epNumber = String(ep.ep || index + 1);
     let url = String(ep.url || "");
-    if (!url) url = await resolvePlay(id, epNumber, config);
+    // 详情里的 ep.url 经常是 /video/xxx/ep-2/ 这种网页地址，
+    // 只有 m3u8/mp4 这类直链才直接使用，否则必须走 /api/play 解析。
+    if (!/\.(m3u8|mp4|flv|mkv|webm)(\?|#|$)/i.test(url)) {
+      url = await resolvePlay(id, epNumber, config);
+    }
     if (!url || !/^https?:\/\//i.test(url)) return "";
 
     const title = String(ep.title || `第${epNumber}集`).replace(/\$/g, " ");
