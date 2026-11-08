@@ -48,12 +48,14 @@
           var last = Number(localStorage.getItem(CACHE_KEY) || 0);
           if (Date.now() - last < 6 * 60 * 60 * 1000) return;
 
+          var proxyBase = localStorage.getItem("PROXY_BASE_URL") || "/proxy/";
+          if (proxyBase.slice(-1) !== "/") proxyBase += "/";
+
+          var upstream =
+            "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/all_sources_config.json";
+
           var xhr = new XMLHttpRequest();
-          xhr.open(
-            "GET",
-            "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/all_sources_config.json",
-            false
-          );
+          xhr.open("GET", proxyBase + encodeURIComponent(upstream), false);
           xhr.send(null);
           if (xhr.status < 200 || xhr.status >= 300) return;
 
