@@ -25,28 +25,40 @@ const CORS = {
   "Access-Control-Max-Age": "86400",
 };
 
-let configCache = { api: DEFAULT_API, site: DEFAULT_SITE, expires: 0 };
+let configCache = { api: DEFAULT_API, site: DEFAULT_SITE, expires: 0, loading: null };
+
+function refreshConfig() {
+  if (configCache.loading) return configCache.loading;
+
+  configCache.loading = (async () => {
+    try {
+      const response = await fetch(SPIDER_JS_URL, {
+        cache: "no-store",
+        signal: AbortSignal.timeout(6000),
+      });
+      if (response.ok) {
+        const text = await response.text();
+        const api = text.match(/(?:const|let|var)\s+API\s*=\s*['"]([^'"]+)['"]/)?.[1];
+        const site = text.match(/(?:const|let|var)\s+SITE\s*=\s*['"]([^'"]+)['"]/)?.[1];
+        if (api) configCache.api = api;
+        if (site) configCache.site = site;
+        configCache.expires = Date.now() + 60 * 60 * 1000;
+      }
+    } catch (error) {
+      console.warn("读取上游 spider 配置失败，使用内置地址:", error);
+    } finally {
+      configCache.loading = null;
+    }
+  })();
+
+  return configCache.loading;
+}
 
 async function getConfig() {
-  if (Date.now() < configCache.expires) return configCache;
-
-  try {
-    const response = await fetch(SPIDER_JS_URL, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(6000),
-    });
-    if (response.ok) {
-      const text = await response.text();
-      const api = text.match(/(?:const|let|var)\s+API\s*=\s*['"]([^'"]+)['"]/)?.[1];
-      const site = text.match(/(?:const|let|var)\s+SITE\s*=\s*['"]([^'"]+)['"]/)?.[1];
-      if (api) configCache.api = api;
-      if (site) configCache.site = site;
-      configCache.expires = Date.now() + 60 * 60 * 1000;
-    }
-  } catch (error) {
-    console.warn("读取上游 spider 配置失败，使用内置地址:", error);
+  // 不阻塞当前请求：先用内置地址，后台刷新上游最新 Worker 地址
+  if (Date.now() >= configCache.expires && !configCache.loading) {
+    refreshConfig().catch(() => {});
   }
-
   return configCache;
 }
 
@@ -141,6 +153,24 @@ async function resolvePlay(id, ep, config) {
   }
 }
 
+async function mapLimit(items, limit, mapper) {
+  const results = new Array(items.length);
+  let next = 0;
+
+  async function worker() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, () => worker())
+  );
+  return results;
+}
+
 async function buildDetail(id, config, origin) {
   let item = null;
   try {
@@ -156,18 +186,18 @@ async function buildDetail(id, config, origin) {
   if (!item) return null;
 
   const episodes = Array.isArray(item.episodes) ? item.episodes.slice(0, 50) : [];
-  const playUrls = [];
 
-  for (let index = 0; index < episodes.length; index++) {
-    const ep = episodes[index];
+  // 并行解析播放地址，避免 30 集串行请求导致详情页很慢
+  const resolved = await mapLimit(episodes, 8, async (ep, index) => {
     const epNumber = String(ep.ep || index + 1);
     let url = String(ep.url || "");
     if (!url) url = await resolvePlay(id, epNumber, config);
-    if (!url || !/^https?:\/\//i.test(url)) continue;
+    if (!url || !/^https?:\/\//i.test(url)) return "";
 
     const title = String(ep.title || `第${epNumber}集`).replace(/\$/g, " ");
-    playUrls.push(`${title}$${url}`);
-  }
+    return `${title}$${url}`;
+  });
+  const playUrls = resolved.filter(Boolean);
 
   // 吃瓜图文帖：正文/帖子接口里才有 video_url
   if (!playUrls.length && id.startsWith("archives_")) {
@@ -206,6 +236,10 @@ export async function onRequest(context) {
 
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS });
+  }
+
+  if (typeof context.waitUntil === "function") {
+    context.waitUntil(refreshConfig().catch(() => {}));
   }
 
   // 封面/图片同域代理，浏览器不直接访问 Worker 域名
