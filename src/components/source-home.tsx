@@ -20,6 +20,7 @@ interface SourceItem {
   vod_id: string;
   vod_name: string;
   vod_pic?: string;
+  vod_pic_thumb?: string;
   vod_remarks?: string;
   type_name?: string;
 }
@@ -78,6 +79,33 @@ function buildSources(): ApiSite[] {
     seen.add(normalized);
     return true;
   });
+}
+
+function posterUrl(raw: string | undefined, site: ApiSite | undefined): string {
+  const value = (raw || "").trim();
+  if (!value) return "";
+
+  let absolute = value;
+  if (value.startsWith("//")) {
+    absolute = `https:${value}`;
+  } else if (site) {
+    try {
+      const origin = new URL(site.api).origin;
+      if (value.startsWith("/")) absolute = `${origin}${value}`;
+      else if (!/^https?:\/\//i.test(value)) absolute = `${origin}/${value}`;
+    } catch {
+      // ignore
+    }
+  }
+
+  // 页面是 HTTPS 时，HTTP 封面会被浏览器拦成混合内容，走代理
+  if (absolute.startsWith("http://")) {
+    const proxyBase = localStorage.getItem("PROXY_BASE_URL") || "/proxy/";
+    const normalized = proxyBase.endsWith("/") ? proxyBase : `${proxyBase}/`;
+    return `${normalized}${encodeURIComponent(absolute)}`;
+  }
+
+  return absolute;
 }
 
 export default function SourceHome() {
@@ -309,7 +337,7 @@ export default function SourceHome() {
               >
                 <div className="relative h-48 w-full overflow-hidden">
                   <img
-                    src={item.vod_pic || noImg}
+                    src={posterUrl(item.vod_pic || item.vod_pic_thumb, currentSite) || noImg}
                     alt={item.vod_name}
                     className="absolute inset-0 h-full w-full object-cover"
                     referrerPolicy="no-referrer"
