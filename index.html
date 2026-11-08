@@ -5,6 +5,11 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MorphoTV - 在线观影</title>
+    <script>
+  if (!localStorage.getItem("PROXY_BASE_URL")) {
+    localStorage.setItem("PROXY_BASE_URL", "/proxy/");
+  }
+</script>
   </head>
   <body>
     <div id="root"></div>
