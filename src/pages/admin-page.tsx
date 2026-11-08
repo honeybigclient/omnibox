@@ -55,6 +55,7 @@ export default function AdminPage() {
   const [email, setEmail] = useState("");
   const [approved, setApproved] = useState(true);
   const [selected, setSelected] = useState<string[]>([]);
+  const [sourceFilter, setSourceFilter] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -70,6 +71,16 @@ export default function AdminPage() {
       })
       .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
   }, []);
+
+  const filteredSources = useMemo(() => {
+    const keyword = sourceFilter.trim().toLowerCase();
+    if (!keyword) return sources;
+    return sources.filter(
+      (site) =>
+        site.name.toLowerCase().includes(keyword) ||
+        site.key.toLowerCase().includes(keyword)
+    );
+  }, [sources, sourceFilter]);
 
   useEffect(() => {
     apiJson("/api/me")
@@ -222,13 +233,28 @@ export default function AdminPage() {
               <span className="text-sm font-medium">
                 可用源（已选 {selected.length} / {sources.length}）
               </span>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Input
+                  value={sourceFilter}
+                  onChange={(event) => setSourceFilter(event.target.value)}
+                  placeholder="筛选源名称或 key"
+                  className="h-8 w-44"
+                />
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={() => setSelected(sources.map((site) => site.key))}
+                  onClick={() =>
+                    setSelected(
+                      Array.from(
+                        new Set([
+                          ...selected,
+                          ...filteredSources.map((site) => site.key),
+                        ])
+                      )
+                    )
+                  }
                 >
-                  全选
+                  全选筛选结果
                 </Button>
                 <Button size="sm" variant="outline" onClick={() => setSelected([])}>
                   清空
@@ -236,7 +262,12 @@ export default function AdminPage() {
               </div>
             </div>
             <div className="grid max-h-72 grid-cols-1 gap-2 overflow-y-auto p-3 sm:grid-cols-2">
-              {sources.map((site) => (
+              {filteredSources.length === 0 && (
+                <div className="col-span-full py-6 text-center text-sm text-muted-foreground">
+                  没有匹配的源
+                </div>
+              )}
+              {filteredSources.map((site) => (
                 <label
                   key={site.key}
                   className="flex cursor-pointer items-center gap-2 rounded p-1.5 text-sm hover:bg-accent"
