@@ -234,6 +234,40 @@ async function buildDetail(id, config, origin) {
   };
 }
 
+const HUANGGUO_CLASSES = [
+  { type_id: "ai-duanju", type_name: "AI短剧" },
+  { type_id: "ai-manju", type_name: "AI漫剧" },
+  { type_id: "ai-huanlian", type_name: "换脸专区" },
+  { type_id: "ai-mogai", type_name: "魔改专区" },
+  { type_id: "chigua", type_name: "吃瓜·全部" },
+  { type_id: "rank:hot", type_name: "热播榜" },
+  { type_id: "rank:recommend", type_name: "推荐榜" },
+  { type_id: "rank:potential", type_name: "潜力榜" },
+];
+
+async function homeList(typeId, page, config) {
+  const type = typeId || "ai-duanju";
+  let url = `${config.api}/api/category/${encodeURIComponent(type)}?page=${page}&size=50&sort=latest`;
+
+  if (type.startsWith("rank:")) {
+    const kind = type.slice("rank:".length) || "hot";
+    url = `${config.api}/api/ranks/${encodeURIComponent(kind)}?page=${page}&size=50`;
+  } else if (type.startsWith("chigua")) {
+    const cate = type.split(":")[1] || "all";
+    url = `${config.api}/api/chigua?cate=${encodeURIComponent(cate)}&page=${page}&size=50`;
+  }
+
+  try {
+    const data = await fetchJson(url, `${config.site}/`);
+    const list = Array.isArray(data?.list) ? data.list.map((item) => toVod(item, config)) : [];
+    const pageCount = Number(data?.pagecount) || page;
+    return { list, pageCount };
+  } catch (error) {
+    console.warn("Worker 首页列表失败:", error);
+    return { list: [], pageCount: page };
+  }
+}
+
 export async function onRequest(context) {
   const { request } = context;
   const url = new URL(request.url);
@@ -277,23 +311,35 @@ export async function onRequest(context) {
   const config = await getConfig();
 
   if (ac === "list") {
-    return jsonResponse({ code: 1, msg: "数据列表", class: [], list: [] });
+    return jsonResponse({ code: 1, msg: "数据列表", class: HUANGGUO_CLASSES, list: [] });
   }
 
   if (ac === "videolist" || (ac === "detail" && !url.searchParams.get("ids"))) {
     const keyword = url.searchParams.get("wd") || "";
-    if (!keyword.trim()) {
-      return jsonResponse({ code: 1, msg: "空关键词", list: [] });
+    if (keyword.trim()) {
+      const list = await search(keyword.trim(), config, url.origin);
+      return jsonResponse({
+        code: 1,
+        msg: "数据列表",
+        page: 1,
+        pagecount: 1,
+        limit: list.length,
+        total: list.length,
+        list,
+      });
     }
-    const list = await search(keyword.trim(), config, url.origin);
+
+    const page = Math.max(1, Number(url.searchParams.get("pg")) || 1);
+    const typeId = url.searchParams.get("t") || "ai-duanju";
+    const home = await homeList(typeId, page, config);
     return jsonResponse({
       code: 1,
       msg: "数据列表",
-      page: 1,
-      pagecount: 1,
-      limit: list.length,
-      total: list.length,
-      list,
+      page,
+      pagecount: home.pageCount,
+      limit: home.list.length,
+      total: home.list.length,
+      list: home.list,
     });
   }
 
