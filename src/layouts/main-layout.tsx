@@ -1,5 +1,5 @@
 import { Outlet, useNavigate } from "react-router-dom";
-import { Settings, Home, History } from "lucide-react";
+import { Settings, History } from "lucide-react";
 import { useState, useEffect } from "react";
 
 import SettingsDialog from "@/components/settings-dialog";
@@ -10,6 +10,7 @@ import { SearchForm } from "@/components/search-form";
 import { Link } from "react-router-dom";
 import { RouterUtils } from "@/utils/router";
 import { Toaster } from "@/components/ui/sonner";
+import logo from "@/assets/logo.png";
 
 export default function MainLayout() {
   const navigate = useNavigate();
@@ -78,16 +79,15 @@ export default function MainLayout() {
       <header className="fixed top-0 left-0 right-0 z-50 border-b border-border/40 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
         <div className="container mx-auto px-4 py-3">
           <div className="flex items-center justify-between md:gap-6">
-            <div className="hidden md:block items-center gap-2">
-              <Link to="/" className=" text-xl font-bold text-primary flex-shrink-0">
+            <Link to="/" className="flex flex-shrink-0 items-center gap-2">
+              <img
+                src={logo}
+                alt="影视资源站"
+                className="h-9 w-9 rounded-full object-cover ring-1 ring-border/50"
+              />
+              <span className="hidden text-xl font-bold text-primary md:block">
                 影视资源站
-              </Link>
-            </div>
-
-            <Link to="/">
-              <Button variant="ghost" size="icon" className="md:hidden hover:bg-muted/80">
-                <Home className="w-4 h-4" />
-              </Button>
+              </span>
             </Link>
 
             <div className="flex-1 max-w-2xl mx-2">
@@ -126,10 +126,10 @@ export default function MainLayout() {
               {/* 设置按钮（移动端） */}
              
               <Button variant="ghost" size="icon" className="md:hidden hover:bg-muted/80" onClick={() => navigate('/history')}>
-                <History className="w-4 h-4" />
+                <History className="w-5 h-5" />
               </Button>
                <Button variant="ghost" size="icon" className="md:hidden hover:bg-muted/80" onClick={() => setShowSettings(true)}>
-                <Settings className="w-4 h-4" />
+                <Settings className="w-5 h-5" />
               </Button>
             </div>
           </div>
