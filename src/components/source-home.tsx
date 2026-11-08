@@ -5,6 +5,7 @@ import { API_SITES } from "@/config/apiSites";
 import { fetchWithProxy } from "@/utils/proxy";
 import { RouterUtils } from "@/utils/router";
 import type { ApiSite } from "@/types/apiSite";
+import { filterAllowedSites } from "@/utils/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -73,12 +74,13 @@ function buildSources(): ApiSite[] {
   const merged = [...API_SITES, ...custom].filter((site) => site?.key && site?.api);
 
   const seen = new Set<string>();
-  return merged.filter((site) => {
+  const unique = merged.filter((site) => {
     const normalized = site.api.replace(/\/+$/, "");
     if (seen.has(normalized)) return false;
     seen.add(normalized);
     return true;
   });
+  return filterAllowedSites(unique);
 }
 
 function posterUrl(raw: string | undefined, site: ApiSite | undefined): string {
