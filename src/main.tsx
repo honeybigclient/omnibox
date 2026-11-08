@@ -12,6 +12,7 @@ import HistoryPage from "./pages/history-page.tsx";
 import OnlinePlayerPage from "./pages/online-player-page.tsx";
 import AISpeedTestPage from "./pages/ai-speed-test-page.tsx";
 import AdminPage from "./pages/admin-page.tsx";
+import { loadMe } from "@/utils/auth";
 
 const router = createHashRouter([
   {
@@ -54,8 +55,10 @@ const router = createHashRouter([
   },
 ]);
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
-  <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
-    <RouterProvider router={router} />
-  </ThemeProvider>
-);
+loadMe().finally(() => {
+  ReactDOM.createRoot(document.getElementById("root")!).render(
+    <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
+      <RouterProvider router={router} />
+    </ThemeProvider>
+  );
+});
