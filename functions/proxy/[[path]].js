@@ -29,7 +29,7 @@ export async function onRequest(context) {
       timestamp: new Date().toISOString(),
     });
   }
-
+ 
   const target = decodeURIComponent(url.pathname.replace(/^\/proxy\//, ""));
   if (!/^https?:\/\//i.test(target)) {
     return json(
