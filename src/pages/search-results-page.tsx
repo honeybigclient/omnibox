@@ -456,6 +456,7 @@ export default function SearchResultsPage() {
 
   const performSearch = async (query: string) => {
     setIsLoading(true);
+    setMovieResults([]);
 
     try {
       // 搜索所有有权限的源，而不只是当前勾选的源
@@ -684,8 +685,16 @@ export default function SearchResultsPage() {
           </div>
         )}
 
+        {isLoading && (
+          <div className="flex flex-col items-center justify-center py-24 text-muted-foreground">
+            <Loader2 className="mb-4 h-9 w-9 animate-spin text-primary" />
+            <p className="text-sm font-medium">正在搜索所有资源站...</p>
+            <p className="mt-1 text-xs">源比较多时可能需要几秒，请稍候</p>
+          </div>
+        )}
+
         {/* 搜索结果 */}
-        {(movieResults.length > 0 || cloudResults.length > 0) && (
+        {!isLoading && (movieResults.length > 0 || cloudResults.length > 0) && (
           <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
             <TabsList className="grid w-full grid-cols-2 bg-muted/50 border border-border/30">
               <TabsTrigger value="movies" className="data-[state=active]:bg-background data-[state=active]:border-border/50">
