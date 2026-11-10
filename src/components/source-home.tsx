@@ -38,6 +38,25 @@ interface SourceListResponse {
 
 const DOUBAN_KEY = "__douban__";
 const HOME_SOURCE_KEY = "homeSourceKey";
+// 记住每个内容源最后停留的"专区"和滚动位置：从剧集页返回时能回到原处。
+const HOME_CATEGORY_PREFIX = "homeSourceCategory:";
+const HOME_SCROLL_PREFIX = "homeSourceScroll:";
+
+function readStoredCategory(key: string): string {
+  try {
+    return localStorage.getItem(HOME_CATEGORY_PREFIX + key) || "";
+  } catch {
+    return "";
+  }
+}
+
+function readStoredScroll(key: string, category: string): number {
+  try {
+    return Number(localStorage.getItem(`${HOME_SCROLL_PREFIX}${key}|${category}`) || "0") || 0;
+  } catch {
+    return 0;
+  }
+}
 
 function readArray(key: string): ApiSite[] {
   try {
@@ -183,15 +202,43 @@ export default function SourceHome() {
     if (!site) return;
 
     localStorage.setItem(HOME_SOURCE_KEY, currentKey);
-    setCurrentCategory("");
+    const restored = readStoredCategory(currentKey);
+    setCurrentCategory(restored);
     setCategories([]);
     setItems([]);
     setPage(1);
     setPageCount(1);
     setError("");
     loadCategories(site);
-    loadList(site, "", 1, false);
+    loadList(site, restored, 1, false);
   }, [currentKey, sources]);
+
+  // 记录滚动位置，返回列表时恢复（只记当前源 + 专区）。
+  useEffect(() => {
+    if (currentKey === DOUBAN_KEY) return;
+    const storageKey = `${HOME_SCROLL_PREFIX}${currentKey}|${currentCategory}`;
+    const remember = () => {
+      try {
+        localStorage.setItem(storageKey, String(window.scrollY || 0));
+      } catch {
+        // 忽略
+      }
+    };
+    window.addEventListener("scroll", remember, { passive: true });
+    return () => {
+      // 卸载时不要再记一次：跳转前 RouterUtils 会把页面滚到顶部，会把位置记成 0。
+      window.removeEventListener("scroll", remember);
+    };
+  }, [currentKey, currentCategory]);
+
+  // 列表渲染完成后，把上次的滚动位置还原回去。
+  useEffect(() => {
+    if (currentKey === DOUBAN_KEY || !items.length || page !== 1) return;
+    const saved = readStoredScroll(currentKey, currentCategory);
+    if (saved <= 0) return;
+    const timer = window.setTimeout(() => window.scrollTo(0, saved), 60);
+    return () => window.clearTimeout(timer);
+  }, [currentKey, currentCategory, items.length, page]);
 
   async function loadCategories(site: ApiSite) {
     try {
@@ -199,9 +246,18 @@ export default function SourceHome() {
       const classes = Array.isArray((data as unknown as { class?: SourceCategory[] }).class)
         ? ((data as unknown as { class: SourceCategory[] }).class)
         : [];
-      setCategories(
-        classes.filter((item) => item?.type_id && item?.type_name)
-      );
+      const valid = classes.filter((item) => item?.type_id && item?.type_name);
+      setCategories(valid);
+      // 恢复的专区如果在这个源里已经不存在（分类改名/换源），回退到"全部"。
+      if (currentCategory && !valid.some((item) => item.type_id === currentCategory)) {
+        setCurrentCategory("");
+        try {
+          localStorage.setItem(HOME_CATEGORY_PREFIX + currentKey, "");
+        } catch {
+          // 忽略
+        }
+        loadList(site, "", 1, false);
+      }
     } catch {
       setCategories([]);
     }
@@ -261,6 +317,11 @@ export default function SourceHome() {
 
   function selectCategory(typeId: string) {
     if (!currentSite) return;
+    try {
+      localStorage.setItem(HOME_CATEGORY_PREFIX + currentKey, typeId);
+    } catch {
+      // 忽略
+    }
     setCurrentCategory(typeId);
     setItems([]);
     setPage(1);
