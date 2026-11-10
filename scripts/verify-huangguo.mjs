@@ -271,6 +271,20 @@ globalThis.fetch = async (input, init = {}) => {
         },
       });
     }
+    if (parsed.pathname === "/empty.ts") {
+      // 模拟 key/分片尚未就绪：200 但空 body。
+      return new Response(null, {
+        status: 200,
+        headers: { "Content-Type": "video/mp2t", "Content-Length": "0" },
+      });
+    }
+    if (parsed.pathname === "/cover.bin") {
+      // 模拟 AES 加密后的封面：不是任何图片魔数。
+      return new Response(
+        new Uint8Array([0x4a, 0x3f, 0x9a, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+        { status: 200, headers: { "Content-Type": "application/octet-stream" } }
+      );
+    }
     return new Response(new Uint8Array([0, 1, 2, 3]), {
       status: 200,
       headers: {
@@ -333,6 +347,13 @@ globalThis.fetch = async (input, init = {}) => {
   }
 
   if (parsed.hostname === "native.test") {
+    // Worker 的封面解密代理。
+    if (parsed.pathname === "/media") {
+      return new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]), {
+        status: 200,
+        headers: { "Content-Type": "image/png" },
+      });
+    }
     if (parsed.pathname.startsWith("/api/category/")) return json(nativeList);
     if (parsed.pathname.startsWith("/api/search/")) return json(nativeSearch);
     if (parsed.pathname === "/api/detail/12527") return json(nativeDetail);
@@ -721,17 +742,18 @@ async function main() {
   );
   const playlist = result.text;
   expect(playlist.startsWith("#EXTM3U"), "playlist passthrough");
+  // key 的 ticket 绑定取清单时的出口 IP，所以必须全部走代理，不能直连。
   expect(
-    playlist.includes('URI="https://cdn.test/enkey?x=1"'),
-    "key direct when CORS ok"
+    playlist.includes("/huangguo/hls?src=https%3A%2F%2Fcdn.test%2Fenkey%3Fx%3D1"),
+    "key proxied"
   );
   expect(
-    playlist.includes("https://cdn.test/seg/1.ts"),
-    "segment direct when CORS ok"
+    playlist.includes("/huangguo/hls?src=https%3A%2F%2Fcdn.test%2Fseg%2F1.ts"),
+    "segment proxied"
   );
   expect(
     playlist.includes("/huangguo/hls?src=https%3A%2F%2Fnocors.test%2F2.ts"),
-    "no-cors segment proxied"
+    "cross-host segment proxied"
   );
   expect(
     playlist.includes("/huangguo/hls?src=https%3A%2F%2Fcdn.test%2Faudio.m3u8"),
@@ -849,6 +871,27 @@ async function main() {
   expect(result.body.code === 1, "playcheck code");
   expect(result.body.rows.length === 1 && result.body.rows[0].id === "13100", "playcheck rows");
   expect(result.body.rows[0].ok === false, "playcheck detects empty media");
+
+  // 6u. 加密封面：原始字节不是图片时，借上游 Worker 的 /media 解密。
+  path = "/huangguo/media?src=" + encodeURIComponent("https://cdn.test/cover.bin") + "&up=huangguo-web";
+  result = await call(path);
+  const coverBytes = new Uint8Array(await result.raw.arrayBuffer());
+  expect(result.status === 200, "media decrypt 200");
+  expect(
+    result.response.headers.get("content-type") === "image/png",
+    "media decrypt content type"
+  );
+  expect(
+    coverBytes[0] === 0x89 && coverBytes[1] === 0x50,
+    "media decrypt png magic"
+  );
+
+  // 6v. key/分片返回 200 但空内容时，要明确报错，别让播放器无限转圈。
+  path = "/huangguo/hls?src=" + encodeURIComponent("https://cdn.test/empty.ts");
+  result = await call(path);
+  await show("6v. 空 key/分片", path, result);
+  expect(result.status === 502, "empty body 502");
+  expect(String(result.body.error || "").includes("空内容"), "empty body error msg");
 
   // 7. MacCMS 上游按 slug 路由 + ac=list。
   path = "/huangguo/api.php/provide/vod/?ac=list&slug=alpha";

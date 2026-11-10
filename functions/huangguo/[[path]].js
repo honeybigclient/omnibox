@@ -2263,6 +2263,34 @@ async function handleUpstreams(url, pool, env) {
 /* 图片代理                                                                    */
 /* -------------------------------------------------------------------------- */
 
+function looksLikeImage(bytes) {
+  if (!bytes || bytes.length < 12) return false;
+  const b = bytes;
+  const jpeg = b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+  const png = b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+  const gif = b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46;
+  const webp =
+    b[0] === 0x52 &&
+    b[1] === 0x49 &&
+    b[2] === 0x46 &&
+    b[3] === 0x46 &&
+    b[8] === 0x57 &&
+    b[9] === 0x45 &&
+    b[10] === 0x42 &&
+    b[11] === 0x50;
+  return jpeg || png || gif || webp;
+}
+
+function imageResponse(bytes, contentType) {
+  return new Response(bytes, {
+    headers: {
+      ...CORS,
+      "Content-Type": contentType || "image/jpeg",
+      "Cache-Control": "public, max-age=86400",
+    },
+  });
+}
+
 async function handleMedia(url, pool) {
   const src = url.searchParams.get("src") || "";
   if (!isHttpUrl(src)) {
@@ -2279,16 +2307,33 @@ async function handleMedia(url, pool) {
       { headers: { "User-Agent": UA, Referer: referer } },
       15000
     );
-    const headers = new Headers(response.headers);
-    for (const [key, value] of Object.entries(CORS)) headers.set(key, value);
-    headers.delete("content-length");
-    headers.delete("content-encoding");
-    headers.delete("transfer-encoding");
-    headers.set("Cache-Control", "public, max-age=86400");
-    return new Response(response.body, {
-      status: response.status,
-      headers,
-    });
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (looksLikeImage(bytes)) {
+      return imageResponse(bytes, response.headers.get("content-type"));
+    }
+
+    // 黄果的封面在被 CDN 上可能是 AES-CBC 加密的原始二进制（不是 base64），
+    // 自己解密没必要——上游 Worker 的 /media 已经做好解密和魔数校验，借用它。
+    const workerApi = (upstream && upstream.api) || DEFAULT_API;
+    if (workerApi && !src.startsWith(workerApi)) {
+      try {
+        const proxied = await fetchWithTimeout(
+          `${workerApi}/media?url=${encodeURIComponent(src)}`,
+          { headers: { "User-Agent": UA, Referer: referer } },
+          15000
+        );
+        if (proxied.ok) {
+          const decrypted = new Uint8Array(await proxied.arrayBuffer());
+          if (looksLikeImage(decrypted)) {
+            return imageResponse(decrypted, proxied.headers.get("content-type"));
+          }
+        }
+      } catch {
+        // 兜不住就把原始内容返回，至少前端能拿到东西。
+      }
+    }
+
+    return imageResponse(bytes, response.headers.get("content-type"));
   } catch (error) {
     return jsonResponse(
       { error: "图片代理失败", message: error && error.message },
@@ -2557,26 +2602,6 @@ function isAllowedHuangguoMeHost(hostname) {
   );
 }
 
-/**
- * 播放代理（解决"一直转圈"的核心）。
- *
- * 背景：原生黄果站的 m3u8 / 分片 / AES key 都没有 CORS 头，302 直跳裸地址后
- * hls.js 的 manifest 或 key 请求会被浏览器拦下来，表现就是无限转圈；而
- * huangguo.me 新站同样没有 CORS。所以播放地址一律先跳回本域 /huangguo/hls，
- * 由 Worker 拉取后再返回给浏览器：
- *
- *   - 播放列表（m3u8）：改写所有 URI。子播放列表继续走代理；key 和分片只在
- *     探测到目标域名确实带 Access-Control-Allow-Origin 时才直连，否则也走
- *     代理。探测结果按域名缓存 6 小时，避免每次播放都重新探测。
- *   - 分片 / key / mp4：原样透传，保留 Range 与 206 状态码，并补上 CORS 头。
- *
- * 代理地址只接受 http(s) src，且不携带任何用户凭据，避免被当成开放代理滥用。
- */
-
-const CORS_PROBE_TTL_SECONDS = 6 * 60 * 60;
-const CORS_MEMO_TTL_MS = 10 * 60 * 1000;
-const corsMemo = new Map(); // origin -> { value, at }
-
 function streamProxyUrl(origin, src, referer) {
   const params = new URLSearchParams({ src: String(src) });
   if (referer) params.set("ref", String(referer));
@@ -2593,81 +2618,27 @@ function isPlaylistResponse(response, sourceUrl) {
   return false;
 }
 
-function classifyPlaylistUri(absUrl, origin) {
-  if (!isHttpUrl(absUrl)) return "raw";
-  let url;
-  try {
-    url = new URL(absUrl);
-  } catch {
-    return "raw";
-  }
-  if (url.origin === origin) return "self";
-  if (/\.m3u8(\?|#|$)/i.test(`${url.pathname}${url.search}`)) return "playlist";
-  return "asset";
-}
+/**
+ * 播放代理（解决"一直转圈"的核心）。
+ *
+ * 背景：原生黄果站的 m3u8 / 分片 / AES key 都没有 CORS 头，302 直跳裸地址后
+ * hls.js 的 manifest 或 key 请求会被浏览器拦下来，表现就是无限转圈；而
+ * huangguo.me 新站同样没有 CORS。所以播放地址一律先跳回本域 /huangguo/hls，
+ * 由 Worker 拉取后再返回给浏览器：
+ *
+ *   - 播放列表（m3u8）：改写所有 URI 为同域代理，包括子播放列表、key、分片。
+ *     不能"能直连就直连"——key 的 ticket 绑定取清单时的出口 IP，浏览器换 IP
+ *     去取会被 CDN 返回 200 + 空 body（hls.js 解不了密 → 无限转圈）。
+ *   - 分片 / key / mp4：原样透传，保留 Range 与 206 状态码，并补上 CORS 头。
+ *
+ * 代理地址只接受 http(s) src，且不携带任何用户凭据，避免被当成开放代理滥用。
+ */
 
-async function hostAllowsCors(sourceOrigin, sampleUrl, referer, env) {
-  const memo = corsMemo.get(sourceOrigin);
-  if (memo && Date.now() - memo.at < CORS_MEMO_TTL_MS) return memo.value;
-
-  const cacheUrl = `https://huangguo.internal/__cors_v2/${encodeURIComponent(
-    sourceOrigin
-  )}`;
-  if (typeof caches !== "undefined" && caches.default) {
-    try {
-      const hit = await caches.default.match(cacheUrl);
-      if (hit) {
-        const value = (await hit.text()) === "1";
-        corsMemo.set(sourceOrigin, { value, at: Date.now() });
-        return value;
-      }
-    } catch {
-      // 缓存不可用时继续探测。
-    }
-  }
-
-  let allowed = false;
-  try {
-    const response = await fetchWithTimeout(
-      sampleUrl,
-      {
-        headers: {
-          "User-Agent": UA,
-          Referer: referer || `${sourceOrigin}/`,
-          Accept: "*/*",
-          Range: "bytes=0-0",
-        },
-      },
-      4000
-    );
-    const acao = String(
-      response.headers.get("access-control-allow-origin") || ""
-    ).trim();
-    allowed = !!acao;
-  } catch {
-    allowed = false;
-  }
-
-  corsMemo.set(sourceOrigin, { value: allowed, at: Date.now() });
-  if (typeof caches !== "undefined" && caches.default) {
-    try {
-      await caches.default.put(
-        cacheUrl,
-        new Response(allowed ? "1" : "0", {
-          headers: {
-            "Content-Type": "text/plain",
-            "Cache-Control": `max-age=${CORS_PROBE_TTL_SECONDS}`,
-          },
-        })
-      );
-    } catch {
-      // 写入失败不影响本次播放。
-    }
-  }
-  return allowed;
-}
-
-async function rewritePlaylist(text, sourceUrl, origin, referer, env) {
+async function rewritePlaylist(text, sourceUrl, origin, referer) {
+  // 关键：ticket 是按"取清单的那个出口 IP"绑定的。清单既然是我们 Worker 取的，
+  // 那 key / 分片也必须由我们 Worker 去取，否则浏览器拿着 Worker 的 ticket 会被
+  // CDN 回一个 200 + 空 body（表现就是 hls.js 解不了密、无限转圈）。
+  // 所以这里不做"能直连就直连"的优化，统一改写成本域代理。
   const base = String(sourceUrl);
   const absolutize = (value) => {
     try {
@@ -2677,48 +2648,15 @@ async function rewritePlaylist(text, sourceUrl, origin, referer, env) {
     }
   };
 
-  // 第一遍：找出每个远端域名的样本地址（取第一个 key/分片），只探测这些域名。
-  const samples = new Map();
-  const collect = (absUrl) => {
-    if (classifyPlaylistUri(absUrl, origin) !== "asset") return;
-    try {
-      const { origin: remote } = new URL(absUrl);
-      if (!samples.has(remote)) samples.set(remote, absUrl);
-    } catch {
-      // 忽略无法解析的地址。
-    }
-  };
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    if (trimmed.startsWith("#")) {
-      for (const match of trimmed.matchAll(/URI="([^"]+)"/g)) {
-        collect(absolutize(match[1]));
-      }
-    } else {
-      collect(absolutize(trimmed));
-    }
-  }
-
-  const directOrigins = new Set();
-  await Promise.all(
-    [...samples.entries()].slice(0, 6).map(async ([remoteOrigin, sample]) => {
-      if (await hostAllowsCors(remoteOrigin, sample, referer, env)) {
-        directOrigins.add(remoteOrigin);
-      }
-    })
-  );
-
   const render = (raw) => {
     const absUrl = absolutize(raw);
-    const kind = classifyPlaylistUri(absUrl, origin);
-    if (kind === "playlist") return streamProxyUrl(origin, absUrl, referer);
-    if (kind === "asset") {
-      const remoteOrigin = new URL(absUrl).origin;
-      if (directOrigins.has(remoteOrigin)) return absUrl;
-      return streamProxyUrl(origin, absUrl, referer);
+    if (!isHttpUrl(absUrl)) return absUrl;
+    try {
+      if (new URL(absUrl).origin === origin) return absUrl;
+    } catch {
+      return absUrl;
     }
-    return absUrl;
+    return streamProxyUrl(origin, absUrl, referer);
   };
 
   return text
@@ -2777,18 +2715,24 @@ async function handleStream(url, request, env) {
     return jsonResponse({ error: `上游返回 HTTP ${response.status}`, src }, 502);
   }
 
+  // key / 分片返回 200 但内容是空的（剧集刚更新或 ticket 失效），
+  // 直接给出明确错误，别让 hls.js 拿着空 key 无限转圈。
+  if (
+    response.status === 200 &&
+    Number(response.headers.get("content-length") || -1) === 0
+  ) {
+    return jsonResponse(
+      { error: "上游返回了空内容（key/分片可能还没生成）", src },
+      502
+    );
+  }
+
   if (isPlaylistResponse(response, src)) {
     const text = await response.text();
     if (!text.trimStart().startsWith("#EXTM3U")) {
       return jsonResponse({ error: "上游返回的不是 m3u8", src }, 502);
     }
-    const rewritten = await rewritePlaylist(
-      text,
-      src,
-      url.origin,
-      referer,
-      env
-    );
+    const rewritten = await rewritePlaylist(text, src, url.origin, referer);
     return new Response(rewritten, {
       headers: {
         ...CORS,
