@@ -120,6 +120,20 @@ const nativePageFallbackDetail = {
   ],
 };
 
+// 模拟 Worker 的真实缺陷：数字 id 时页面兜底失败，传剧集页地址时才成功。
+const nativeWorkerPageBugDetail = {
+  list: [
+    {
+      vod_id: 12900,
+      vod_name: "Worker 页面兜底测试",
+      vod_pic: "https://img.test/cover.jpg",
+      episodes: [
+        { ep: 1, title: "第1集", url: "https://site.test/video/12900/ep-1/" },
+      ],
+    },
+  ],
+};
+
 // 所有播放兜底都失败：502 应带 attempts，说明每一步失败原因。
 const nativeNoMediaDetail = {
   list: [
@@ -222,11 +236,17 @@ globalThis.fetch = async (input, init = {}) => {
     if (parsed.pathname === "/api/detail/12600") return json(nativeLazyDetail);
     if (parsed.pathname === "/api/detail/12700") return json(nativePageFallbackDetail);
     if (parsed.pathname === "/api/detail/12800") return json(nativeNoMediaDetail);
+    if (parsed.pathname === "/api/detail/12900") return json(nativeWorkerPageBugDetail);
     if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
     if (parsed.pathname === "/api/play") {
       const target = String(parsed.searchParams.get("url") || "");
       if (target.includes("12700") || target.includes("12800")) {
         return json({ url: "", proxy: "" });
+      }
+      // 只传数字 id 时模拟 Worker 页面兜底失败；传真实剧集页地址时成功。
+      if (target === "12900") return json({ url: "", proxy: "" });
+      if (target.includes("12900")) {
+        return json({ url: "https://cdn.test/from-page-12900.m3u8" });
       }
       return json({ url: "https://cdn.test/play.m3u8" });
     }
@@ -503,6 +523,36 @@ async function main() {
   expect(
     result.body.attempts.some((item) => item.step === "worker-play" && item.ok === false),
     "worker attempt visible"
+  );
+
+  // 6h. 真实 Worker 缺陷模拟：详情页地址必须出现在惰性 URL 里。
+  path = "/huangguo/api.php/provide/vod/?ac=detail&ids=12900";
+  result = await call(path);
+  await show("6h. Worker 页面兜底测试详情", path, result);
+  const workerBugLazy = result.body.list[0].vod_play_url.split("#")[0].split("$")[1];
+  expect(
+    new URL(workerBugLazy).searchParams.get("page") === "https://site.test/video/12900/ep-1/",
+    "worker bug page hint"
+  );
+  const workerBugPath = new URL(workerBugLazy).pathname + new URL(workerBugLazy).search;
+  result = await call(workerBugPath);
+  await show("6i. 带 page 后 Worker 页面兜底成功", workerBugPath, result);
+  console.log(`Location: ${result.response.headers.get("location")}`);
+  expect(result.status === 302, "worker page bug 302");
+  expect(
+    result.response.headers.get("location") === "https://cdn.test/from-page-12900.m3u8",
+    "worker page bug location"
+  );
+
+  // 6j. 旧惰性 URL 没有 page 时，v3 会自动回详情取 page，仍然能播。
+  path = "/huangguo/play.m3u8?up=huangguo-web&id=12900&ep=1";
+  result = await call(path);
+  await show("6j. 旧惰性 URL 自动回详情取 page", path, result);
+  console.log(`Location: ${result.response.headers.get("location")}`);
+  expect(result.status === 302, "legacy lazy 302");
+  expect(
+    result.response.headers.get("location") === "https://cdn.test/from-page-12900.m3u8",
+    "legacy lazy location"
   );
 
   // 7. MacCMS 上游按 slug 路由 + ac=list。
