@@ -54,6 +54,9 @@ const HUANGGUO_ME_UPSTREAM = {
   api: HUANGGUO_ME,
   site: HUANGGUO_ME,
 };
+// 官方跳转页把镜像清单写在 publish.js 里（子域 × 域名 随机拼线路），
+// 主站被墙或握手失败时可以自动换线。
+const PUBLISH_JS_URL = "https://huangguoai.pages.dev/publish.js";
 const SPIDER_JS_URL =
   "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/huangguo_web_spider.js";
 const SOURCES_JSON_URL =
@@ -439,6 +442,47 @@ async function checkAccess(request, env) {
 /* 上游池                                                                      */
 /* -------------------------------------------------------------------------- */
 
+function publishArray(text, name) {
+  const match = String(text || "").match(
+    new RegExp(`var\\s+${name}\\s*=\\s*\\[([\\s\\S]*?)\\]`)
+  );
+  if (!match) return [];
+  return [...match[1].matchAll(/['"]([^'"]+)['"]/g)]
+    .map((item) => item[1].trim())
+    .filter(Boolean);
+}
+
+/** 从 publish.js 拼出镜像线路：https://<sub>.<domain>/ */
+function parsePublishMirrors(text) {
+  const subs = publishArray(text, "subdomains")
+    .filter((item) => /^[a-z0-9-]{1,12}$/i.test(item))
+    .slice(0, 6);
+  const domains = publishArray(text, "urls")
+    .map((item) => item.replace(/\/+$/, ""))
+    .filter((item) => /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(item))
+    .slice(0, 3);
+  const forever = publishArray(text, "foreverUrls").filter((item) =>
+    /^https?:\/\//i.test(item)
+  );
+
+  const out = [];
+  for (const sub of subs) {
+    for (const domain of domains) out.push(`https://${sub}.${domain}/`);
+  }
+  for (const item of forever) {
+    if (/pages\.dev/i.test(item)) continue;
+    out.push(item);
+  }
+  return [...new Set(out)].slice(0, 10);
+}
+
+function envMirrors(env) {
+  return String((env && env.HUANGGUO_MIRRORS) || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => /^https?:\/\//i.test(item));
+}
+
 function nativeUpstream(api, site, source = "spider") {
   const key = "huangguo_web";
   return {
@@ -449,6 +493,7 @@ function nativeUpstream(api, site, source = "spider") {
     source,
     api: normalizeBase(api || DEFAULT_API),
     site: normalizeBase(site || DEFAULT_SITE),
+    mirrors: [],
   };
 }
 
@@ -726,9 +771,10 @@ async function refreshPool(env) {
 
   poolState.loading = (async () => {
     const previous = poolState.pool || (await cacheGetPool());
-    const [spiderResult, sourcesResult] = await Promise.allSettled([
+    const [spiderResult, sourcesResult, publishResult] = await Promise.allSettled([
       fetchText(SPIDER_JS_URL, 8000),
       fetchText(SOURCES_JSON_URL, 10000),
+      fetchText(PUBLISH_JS_URL, 6000),
     ]);
 
     let native = nativeUpstream(DEFAULT_API, DEFAULT_SITE, "builtin");
@@ -738,6 +784,17 @@ async function refreshPool(env) {
     } else {
       console.warn("读取黄果 spider 配置失败，沿用内置地址");
     }
+
+    // 镜像线路：环境变量优先，否则用官方 publish.js 里的域名清单。
+    const parsedMirrors =
+      publishResult.status === "fulfilled"
+        ? parsePublishMirrors(publishResult.value)
+        : previous
+          ? parseMirrorsFromPrevious(previous)
+          : [];
+    native.mirrors = [...new Set([...envMirrors(env), ...parsedMirrors])].filter(
+      (item) => hostOfUrl(item) !== hostOfUrl(native.site)
+    );
 
     let configUpstreams = [];
     const parsedConfig =
@@ -785,6 +842,14 @@ async function refreshPool(env) {
   return poolState.loading;
 }
 
+function parseMirrorsFromPrevious(pool) {
+  const native =
+    pool && Array.isArray(pool.upstreams)
+      ? pool.upstreams.find((item) => item.kind === "huangguo")
+      : null;
+  return native && Array.isArray(native.mirrors) ? native.mirrors : [];
+}
+
 function scheduleRefresh(env, context) {
   const task = refreshPool(env);
   if (context && typeof context.waitUntil === "function") {
@@ -793,7 +858,7 @@ function scheduleRefresh(env, context) {
   return task;
 }
 
-async function getPool(env, context, options = {}) {
+async function getPoolRaw(env, context, options = {}) {
   const envPool = poolFromEnv(env);
   if (envPool) return envPool;
 
@@ -843,6 +908,25 @@ async function getPool(env, context, options = {}) {
   poolState.pool = bootstrap;
   poolState.expiresAt = bootstrap.expiresAt;
   return bootstrap;
+}
+
+/** 环境变量里的镜像线路即时生效，不依赖池子刷新。 */
+function applyEnvMirrors(pool, env) {
+  const extra = envMirrors(env);
+  if (!pool || !extra.length) return pool;
+  const native = pool.upstreams.find((item) => item.kind === "huangguo");
+  if (!native) return pool;
+  const siteHost = hostOfUrl(native.site);
+  const merged = [
+    ...(Array.isArray(native.mirrors) ? native.mirrors : []),
+    ...extra.filter((item) => hostOfUrl(item) !== siteHost),
+  ];
+  native.mirrors = [...new Set(merged)];
+  return pool;
+}
+
+async function getPool(env, context, options = {}) {
+  return applyEnvMirrors(await getPoolRaw(env, context, options), env);
 }
 
 function defaultUpstream(pool) {
@@ -966,6 +1050,39 @@ function refererOf(upstream) {
   return `${(upstream && (upstream.site || originOf(upstream.api))) || DEFAULT_SITE}/`;
 }
 
+/** 原生源的镜像线路：同一套后端换域名，主站不可达时自动换线。 */
+function hostOfUrl(value) {
+  try {
+    return new URL(value).host;
+  } catch {
+    return "";
+  }
+}
+
+function mirrorUrls(upstream, url) {
+  const list = [url];
+  const mirrors = Array.isArray(upstream.mirrors) ? upstream.mirrors : [];
+  if (!mirrors.length) return list;
+  const siteHost = hostOfUrl(upstream.site);
+  const target = hostOfUrl(url);
+  if (!target || target !== siteHost) return list;
+
+  for (const mirror of mirrors.slice(0, 8)) {
+    try {
+      const m = new URL(mirror);
+      if (m.host === target) continue;
+      const swapped = new URL(url);
+      swapped.protocol = m.protocol;
+      swapped.host = m.host;
+      const candidate = swapped.toString();
+      if (!list.includes(candidate)) list.push(candidate);
+    } catch {
+      // 忽略坏的镜像地址。
+    }
+  }
+  return list;
+}
+
 async function requestUpstreamJson(upstream, url, env, options = {}) {
   const timeoutMs = clamp(
     Number(options.timeoutMs) || upstreamTimeout(env),
@@ -984,78 +1101,87 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
     );
   }
 
-  const start = Date.now();
-  let status = null;
+  const headers = {
+    "User-Agent": UA,
+    Referer: refererOf(upstream),
+    Accept: "application/json, text/plain, */*",
+    ...(options.headers || {}),
+  };
 
-  try {
-    const response = await fetchWithTimeout(
-      url,
-      {
-        headers: {
-          "User-Agent": UA,
-          Referer: refererOf(upstream),
-          Accept: "application/json, text/plain, */*",
-          ...(options.headers || {}),
-        },
-      },
-      timeoutMs
-    );
-    status = response.status;
-    const text = await response.text();
-    const ms = Date.now() - start;
+  const candidates = mirrorUrls(upstream, url);
+  const startedAll = Date.now();
+  let lastError = null;
 
-    if (!response.ok) {
-      throw new UpstreamError(upstream, "http", `HTTP ${response.status}`, {
-        status,
-        ms,
-      });
-    }
-
-    let data;
+  for (const target of candidates) {
+    const start = Date.now();
+    let status = null;
     try {
-      data = JSON.parse(text);
-    } catch {
-      throw new UpstreamError(upstream, "parse", "响应不是有效 JSON", {
-        status,
-        ms,
-      });
-    }
-    if (!data || typeof data !== "object") {
-      throw new UpstreamError(upstream, "parse", "响应 JSON 不是对象", {
-        status,
-        ms,
-      });
-    }
-    if (Number(data.code) === 0) {
-      const message = String(data.msg || data.message || "上游返回 code=0").trim();
-      throw new UpstreamError(upstream, "upstream", message, { status, ms });
-    }
+      const response = await fetchWithTimeout(target, { headers }, timeoutMs);
+      status = response.status;
+      const text = await response.text();
+      const ms = Date.now() - start;
 
-    markSuccess(upstream, ms);
-    return { data, ms, status };
-  } catch (error) {
-    const ms = Date.now() - start;
-    let err = error;
-    if (!(err instanceof UpstreamError)) {
-      const name = String((error && error.name) || "");
-      const message = String((error && error.message) || "");
-      const timeout =
-        name === "AbortError" ||
-        name === "TimeoutError" ||
-        /abort|timed? ?out/i.test(message);
-      const kind = timeout ? "timeout" : "network";
-      err = new UpstreamError(
-        upstream,
-        kind,
-        timeout ? `请求超过 ${timeoutMs}ms` : message || "网络请求失败",
-        { status, ms }
-      );
-    } else if (!err.ms) {
-      err.ms = ms;
+      if (!response.ok) {
+        throw new UpstreamError(upstream, "http", `HTTP ${response.status}`, {
+          status,
+          ms,
+        });
+      }
+
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new UpstreamError(upstream, "parse", "响应不是有效 JSON", {
+          status,
+          ms,
+        });
+      }
+      if (!data || typeof data !== "object") {
+        throw new UpstreamError(upstream, "parse", "响应 JSON 不是对象", {
+          status,
+          ms,
+        });
+      }
+      if (Number(data.code) === 0) {
+        const message = String(data.msg || data.message || "上游返回 code=0").trim();
+        throw new UpstreamError(upstream, "upstream", message, { status, ms });
+      }
+
+      markSuccess(upstream, ms);
+      return { data, ms, status };
+    } catch (error) {
+      const ms = Date.now() - start;
+      let err = error;
+      if (!(err instanceof UpstreamError)) {
+        const name = String((error && error.name) || "");
+        const message = String((error && error.message) || "");
+        const timeout =
+          name === "AbortError" ||
+          name === "TimeoutError" ||
+          /abort|timed? ?out/i.test(message);
+        const kind = timeout ? "timeout" : "network";
+        err = new UpstreamError(
+          upstream,
+          kind,
+          timeout ? `请求超过 ${timeoutMs}ms` : message || "网络请求失败",
+          { status, ms }
+        );
+      } else if (!err.ms) {
+        err.ms = ms;
+      }
+      lastError = err;
+      // 还有镜像线路就继续换线，全挂了才记失败。
     }
-    markFailure(upstream, err, env);
-    throw err;
   }
+
+  const err =
+    lastError ||
+    new UpstreamError(upstream, "network", "没有可用的上游线路", {
+      ms: Date.now() - startedAll,
+    });
+  markFailure(upstream, err, env);
+  throw err;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2017,6 +2143,7 @@ function upstreamReport(upstream) {
         : hostOf(upstream.endpoint),
     status,
     latencyMs: state ? state.latencyMs : null,
+    mirrors: Array.isArray(upstream.mirrors) ? upstream.mirrors.length : 0,
     lastCheckedAt: state ? isoTime(state.lastCheckedAt) : null,
     lastSuccessAt: state ? isoTime(state.lastSuccessAt) : null,
     lastError: state ? state.lastError : null,
@@ -2496,6 +2623,77 @@ async function fetchHuangguoMeText(url, referer, timeoutMs) {
 }
 
 /**
+ * 新站详情页只给一部分 /play/ 链接（付费/未解锁的不出现），所以不能按列表
+ * 位置映射集数——那会让后面几集全变成最后一集的内容。这里逐章取
+ * currentEpisode，按真实集号建映射，并缓存 6 小时。
+ */
+async function mapMeChapters(slug, plays, env) {
+  const cacheUrl = `https://huangguo.internal/__me_chapters_v1/${encodeURIComponent(
+    slug
+  )}`;
+  if (typeof caches !== "undefined" && caches.default) {
+    try {
+      const hit = await caches.default.match(cacheUrl);
+      if (hit) {
+        const cached = await hit.json();
+        if (Array.isArray(cached) && cached.length) return cached;
+      }
+    } catch {
+      // 缓存坏了就重新抓。
+    }
+  }
+
+  const rows = await mapLimit(plays.slice(0, 12), 4, async (playPath) => {
+    const chapterId = playPath.split("/").filter(Boolean).pop();
+    try {
+      const { data } = await requestUpstreamJson(
+        HUANGGUO_ME_UPSTREAM,
+        `${HUANGGUO_ME}/api/playlet/chapter/detail?chapterId=${encodeURIComponent(
+          chapterId
+        )}&playletSlug=${encodeURIComponent(slug)}`,
+        env,
+        { timeoutMs: 6000 }
+      );
+      const detail = (data && data.data) || {};
+      return {
+        chapterId,
+        playPath,
+        episode: Number(detail.currentEpisode) || 0,
+        videoUrl: String(detail.videoUrl || "").trim(),
+        needUnlock: !!detail.needUnlock,
+        canWatch: detail.canWatch !== false,
+      };
+    } catch (error) {
+      return {
+        chapterId,
+        playPath,
+        episode: 0,
+        videoUrl: "",
+        error: playAttemptError(error),
+      };
+    }
+  });
+
+  const chapters = rows.filter(Boolean);
+  if (typeof caches !== "undefined" && caches.default && chapters.length) {
+    try {
+      await caches.default.put(
+        cacheUrl,
+        new Response(JSON.stringify(chapters), {
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "max-age=21600",
+          },
+        })
+      );
+    } catch {
+      // 写缓存失败不影响本次播放。
+    }
+  }
+  return chapters;
+}
+
+/**
  * 旧站播放失败后的新站兜底（路线来自 iodefog/HuangGuoVideo-Download）：
  * 按剧名搜索 huangguo.me -> 详情页取 /play/{slug}/{chapterId}/ ->
  * /api/playlet/chapter/detail -> data.videoUrl -> /h5/m3u8/{videoUrl}
@@ -2618,17 +2816,62 @@ async function resolveHuangguoMeByTitle(title, ep, env) {
     };
   }
 
-  const epIndex = Math.min(
-    Math.max(0, (Number(ep) || 1) - 1),
-    best.plays.length - 1
-  );
-  const playPath = best.plays[epIndex] || best.plays[0];
-  const chapterId = playPath.split("/").filter(Boolean).pop();
   const slug = best.link.split("/").filter(Boolean).pop();
-  const playPage = `${HUANGGUO_ME}${playPath}`;
+  const epNumber = Math.max(1, Number(ep) || 1);
+  const chapters = await mapMeChapters(slug, best.plays, env);
+  const available = chapters
+    .map((item) => item.episode)
+    .filter((value) => value > 0)
+    .sort((a, b) => a - b);
+
+  const target = chapters.find((item) => item.episode === epNumber) || null;
+  if (!target) {
+    // 不能退回"最后一集"顶替，否则后面几集全会播成同一集的内容。
+    attempts.push({
+      step: "huangguo-me-episode",
+      ok: false,
+      want: epNumber,
+      available,
+      reason: available.length
+        ? `新站只有第 ${available.join("、")} 集`
+        : "新站没有可播分集",
+    });
+    return {
+      stream: "",
+      playPage: `${HUANGGUO_ME}/detail/${slug}/`,
+      title: best.rawTitle,
+      attempts,
+    };
+  }
+
+  const chapterId = target.chapterId;
+  const playPage = `${HUANGGUO_ME}${target.playPath}`;
+  attempts.push({
+    step: "huangguo-me-episode",
+    ok: true,
+    want: epNumber,
+    available,
+    chapterId,
+  });
 
   try {
     const started = Date.now();
+    const directRaw = String(target.videoUrl || "").trim();
+    if (directRaw) {
+      const stream = /^https?:\/\//i.test(directRaw)
+        ? directRaw
+        : `${HUANGGUO_ME}/h5/m3u8/${directRaw.replace(/^\/+/, "")}`;
+      attempts.push({
+        step: "huangguo-me-api",
+        ok: true,
+        ms: 0,
+        episode: epNumber,
+        cached: true,
+        totalMs: Date.now() - startedAll,
+      });
+      return { stream, playPage, title: best.rawTitle, attempts };
+    }
+
     const { data, status } = await requestUpstreamJson(
       HUANGGUO_ME_UPSTREAM,
       `${HUANGGUO_ME}/api/playlet/chapter/detail?chapterId=${encodeURIComponent(

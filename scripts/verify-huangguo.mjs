@@ -196,6 +196,18 @@ const nativeCookieDetail = {
   ],
 };
 
+// 主站接口 404 时，应自动换到镜像线路。
+const nativeMirrorDetail = {
+  list: [
+    {
+      vod_id: 13400,
+      vod_name: "镜像线路测试",
+      vod_pic: "https://img.test/cover.jpg",
+      episodes: [{ ep: 1, title: "第1集", url: "https://site.test/video/13400/ep-1/" }],
+    },
+  ],
+};
+
 // 详情存在但 episodes 为空：应明确报 no_playable，而不是“没有找到内容”。
 const nativeEmptyDetail = {
   list: [
@@ -306,6 +318,14 @@ globalThis.fetch = async (input, init = {}) => {
     });
   }
 
+  // 镜像线路：主站 site.test 上 13400 返回 404，镜像才有数据。
+  if (parsed.hostname === "mirror.test") {
+    if (parsed.pathname === "/api/videos/13400/play") {
+      return json({ data: { duration: 200, video_url: "https://cdn.test/mirror.m3u8" } });
+    }
+    return json({ code: 0, msg: "not found" }, 404);
+  }
+
   if (parsed.hostname === "nocors.test") {
     return new Response(new Uint8Array([0, 1, 2, 3]), {
       status: 200,
@@ -329,6 +349,41 @@ globalThis.fetch = async (input, init = {}) => {
   }
 
   if (parsed.hostname === "huangguo.me") {
+    if (parsed.pathname === "/search/") {
+      // 只对"测试短剧"这个精确剧名返回结果，其他搜索保持空结果。
+      if (parsed.searchParams.get("q") === "测试短剧") {
+        return new Response('<a href="/detail/testplaylet/">测试短剧</a>', {
+          status: 200,
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        });
+      }
+      return new Response("<html>no result</html>", {
+        status: 200,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+    if (parsed.pathname === "/detail/testplaylet/") {
+      return new Response(
+        '<title>测试短剧 - 黄果短剧</title>' +
+          '<a href="/play/testplaylet/">播放</a>' +
+          '<a href="/play/testplaylet/101/">第1集</a>' +
+          '<a href="/play/testplaylet/102/">第2集</a>',
+        { status: 200, headers: { "Content-Type": "text/html; charset=utf-8" } }
+      );
+    }
+    if (parsed.pathname === "/api/playlet/chapter/detail") {
+      const chapterId = parsed.searchParams.get("chapterId");
+      const map = { "101": 1, "102": 2 };
+      return json({
+        code: 1,
+        data: {
+          currentEpisode: map[chapterId] || 0,
+          videoUrl: map[chapterId] ? `v3/ep${map[chapterId]}.m3u8` : "",
+          needUnlock: false,
+          canWatch: true,
+        },
+      });
+    }
     if (parsed.pathname === "/h5/m3u8/test.m3u8") {
       return new Response(
         '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="/enkey?x=1"\n#EXTINF:5,\n/seg/1.ts\n',
@@ -358,6 +413,10 @@ globalThis.fetch = async (input, init = {}) => {
       );
     }
     if (parsed.pathname.startsWith("/api/videos/")) {
+      // 13400 在主站 404，用来验证镜像换线。
+      if (parsed.pathname.includes("13400")) {
+        return json({ code: 0, msg: "not found" }, 404);
+      }
       // 13200 模拟"有 duration、没有 video_url"的新更新剧集。
       if (parsed.pathname.includes("13200")) {
         return json({ data: { duration: 360, video_url: "" } });
@@ -395,6 +454,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (parsed.pathname === "/api/detail/13100") return json(nativeDeepDetail);
     if (parsed.pathname === "/api/detail/13200") return json(nativePendingDetail);
     if (parsed.pathname === "/api/detail/13300") return json(nativeCookieDetail);
+    if (parsed.pathname === "/api/detail/13400") return json(nativeMirrorDetail);
     if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
     if (parsed.pathname === "/api/play") {
       const target = String(parsed.searchParams.get("url") || "");
@@ -403,7 +463,8 @@ globalThis.fetch = async (input, init = {}) => {
         target.includes("12800") ||
         target.includes("13000") ||
         target.includes("13200") ||
-        target.includes("13300")
+        target.includes("13300") ||
+        target.includes("13400")
       ) {
         return json({ url: "", proxy: "" });
       }
@@ -935,6 +996,47 @@ async function main() {
   expect(
     result.response.headers.get("location") === "https://cdn.test/cookie.m3u8",
     "cookie retry location"
+  );
+
+  // 6x. 主站接口 404 时自动换镜像线路。
+  path =
+    "/huangguo/play.m3u8?up=huangguo-web&id=13400&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/13400/ep-1/");
+  result = await call(path, { env: { HUANGGUO_MIRRORS: "https://mirror.test" } });
+  await show("6x. 镜像线路兜底", path, result);
+  expect(result.status === 302, "mirror failover 302");
+  expect(
+    result.response.headers.get("location") === "https://cdn.test/mirror.m3u8",
+    "mirror failover location"
+  );
+
+  // 6y. 新站兜底必须按真实集号取章节，不能拿最后一集顶替。
+  const mePlay = (ep) =>
+    "/huangguo/play.m3u8?up=huangguo-web&id=13000&ep=" +
+    ep +
+    "&page=" +
+    encodeURIComponent("https://site.test/video/13000/ep-1/") +
+    "&title=" +
+    encodeURIComponent("测试短剧");
+
+  result = await call(mePlay(2));
+  await show("6y. 新站第2集按集号命中", mePlay(2), result);
+  expect(result.status === 302, "me episode 2 302");
+  expect(
+    proxiedSrc(result) === "https://huangguo.me/h5/m3u8/v3/ep2.m3u8",
+    "me episode 2 maps by currentEpisode"
+  );
+
+  result = await call(mePlay(3));
+  await show("6z. 新站没有第3集时明确失败", mePlay(3), result);
+  expect(result.status === 502, "me missing episode 502");
+  const meEpisodeAttempt = (result.body.attempts || []).find(
+    (item) => item.step === "huangguo-me-episode"
+  );
+  expect(!!meEpisodeAttempt && meEpisodeAttempt.ok === false, "me episode miss reported");
+  expect(
+    JSON.stringify(meEpisodeAttempt.available) === "[1,2]",
+    "me available episodes listed"
   );
 
   // 7. MacCMS 上游按 slug 路由 + ac=list。
