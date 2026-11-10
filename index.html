@@ -41,9 +41,126 @@
       })();
     </script>
     <script>
-      // 上游池由服务端定时/后台同步，前端只异步读取诊断接口，不再用同步 XHR 阻塞首屏。
+      // 上游池在服务端定时刷新（5h TTL + 后台刷新），前端只负责让源列表跟上：
+      // 用 updatedAt + slug 集合做指纹，池子没变就什么都不做；
+      // 变了也只增删 hg_*，内置源 / 用户自建源 / remote_* 一律原样保留。
       (function () {
-        function syncUpstreams() {
+        var SYNC_KEY = "huangguoSourceSync";
+        var INTERVAL_MS = 10 * 60 * 1000;
+        var MANAGED_PREFIX = "hg_";
+        var running = false;
+
+        function readArray(key) {
+          try {
+            var parsed = JSON.parse(localStorage.getItem(key) || "[]");
+            return Array.isArray(parsed) ? parsed : [];
+          } catch (error) {
+            return [];
+          }
+        }
+
+        function writeArray(key, value) {
+          try {
+            localStorage.setItem(key, JSON.stringify(value));
+          } catch (error) {
+            console.warn("写入 " + key + " 失败:", error);
+          }
+        }
+
+        function fingerprintOf(data) {
+          var slugs = (data.upstreams || [])
+            .map(function (item) {
+              return item && item.slug;
+            })
+            .filter(Boolean)
+            .sort();
+          return [data.updatedAt || "", slugs.join(",")].join("|");
+        }
+
+        function managedSites(data) {
+          var origin = location.origin;
+          var managed = [];
+          (data.upstreams || []).forEach(function (item) {
+            if (!item || !item.slug) return;
+            // 默认黄果继续用同步注册的 key=huangguo 源，避免重复。
+            if (item.kind === "huangguo" || item.slug === data.defaultSlug) return;
+            managed.push({
+              key: MANAGED_PREFIX + item.slug,
+              name: item.name || item.slug,
+              api: origin + "/huangguo/" + item.slug,
+              isCustom: true,
+            });
+          });
+          return managed;
+        }
+
+        function apply(data) {
+          var managed = managedSites(data);
+          var managedKeys = {};
+          managed.forEach(function (item) {
+            managedKeys[item.key] = 1;
+          });
+
+          // 只动 hg_*：其他源（内置、用户自建、remote_*）全部保留。
+          var current = readArray("customApiSites");
+          var byKey = {};
+          current.forEach(function (site) {
+            if (!site || !site.key) return;
+            if (String(site.key).indexOf(MANAGED_PREFIX) === 0) return;
+            byKey[site.key] = site;
+          });
+          managed.forEach(function (site) {
+            byKey[site.key] = site;
+          });
+          var next = Object.keys(byKey).map(function (key) {
+            return byKey[key];
+          });
+          if (JSON.stringify(next) !== JSON.stringify(current)) {
+            writeArray("customApiSites", next);
+          }
+
+          // 已选中的源：只清理已经消失的 hg_*，别的选择一律不动。
+          var selected = readArray("selectedApiSites");
+          var selectedKept = selected.filter(function (key) {
+            var value = String(key);
+            if (value.indexOf(MANAGED_PREFIX) !== 0) return true;
+            return !!managedKeys[value];
+          });
+          if (selectedKept.length !== selected.length) {
+            writeArray("selectedApiSites", selectedKept);
+          }
+
+          return managed.length;
+        }
+
+        function storeDiagnostics(data) {
+          try {
+            localStorage.setItem(
+              "huangguoUpstreams",
+              JSON.stringify({
+                updatedAt: data.updatedAt,
+                defaultSlug: data.defaultSlug,
+                count: data.count,
+                upstreams: (data.upstreams || []).map(function (item) {
+                  return {
+                    slug: item.slug,
+                    name: item.name,
+                    kind: item.kind,
+                    status: item.status,
+                    latencyMs: item.latencyMs,
+                    lastError: item.lastError,
+                  };
+                }),
+              })
+            );
+          } catch (error) {
+            // 诊断信息写不进去不影响播放。
+          }
+        }
+
+        function sync(attempt) {
+          if (running) return;
+          running = true;
           fetch("/huangguo/?ac=upstreams", {
             cache: "no-store",
             credentials: "same-origin",
@@ -53,91 +170,61 @@
               return response.ok ? response.json() : null;
             })
             .then(function (data) {
-              if (!data || !Array.isArray(data.upstreams)) return;
+              if (!data || !Array.isArray(data.upstreams) || !data.upstreams.length) {
+                throw new Error("上游池为空");
+              }
+              storeDiagnostics(data);
+
+              var fingerprint = fingerprintOf(data);
+              var previous = "";
               try {
-                // 诊断信息只保留轻量字段，供设置页/控制台排查。
-                localStorage.setItem(
-                  "huangguoUpstreams",
-                  JSON.stringify({
-                    updatedAt: data.updatedAt,
-                    defaultSlug: data.defaultSlug,
-                    count: data.count,
-                    upstreams: data.upstreams.map(function (item) {
-                      return {
-                        slug: item.slug,
-                        name: item.name,
-                        kind: item.kind,
-                        status: item.status,
-                        latencyMs: item.latencyMs,
-                        lastError: item.lastError,
-                      };
-                    }),
-                  })
-                );
+                previous = localStorage.getItem(SYNC_KEY) || "";
+              } catch (error) {
+                previous = "";
+              }
+              // 指纹没变说明池子没变，不重写、不触发重渲染。
+              if (previous === fingerprint) return;
 
-                // 只拿到默认上游时不重建列表，避免一次同步失败把已有源清空。
-                if (data.upstreams.length < 2) return;
-
-                var origin = location.origin;
-                var managed = [];
-                data.upstreams.forEach(function (item) {
-                  if (!item || !item.slug) return;
-                  // 默认黄果继续用同步注册的 key=huangguo 源，避免重复。
-                  if (item.kind === "huangguo" || item.slug === data.defaultSlug) return;
-                  managed.push({
-                    key: "hg_" + item.slug,
-                    name: item.name || item.slug,
-                    api: origin + "/huangguo/" + item.slug,
-                    isCustom: true,
-                  });
-                });
-                if (!managed.length) return;
-
-                // 把旧版 remote_* 直连源和上一轮 hg_* 源一起替换成走服务端适配层的源。
-                var custom = JSON.parse(localStorage.getItem("customApiSites") || "[]");
-                if (!Array.isArray(custom)) custom = [];
-                var kept = custom.filter(function (site) {
-                  if (!site) return false;
-                  var key = String(site.key);
-                  return key.indexOf("remote_") !== 0 && key.indexOf("hg_") !== 0;
-                });
-                localStorage.setItem(
-                  "customApiSites",
-                  JSON.stringify(kept.concat(managed))
-                );
-
-                var managedKeys = {};
-                managed.forEach(function (site) {
-                  managedKeys[site.key] = 1;
-                });
-                var selected = JSON.parse(localStorage.getItem("selectedApiSites") || "[]");
-                if (Array.isArray(selected)) {
-                  var selectedKept = selected.filter(function (key) {
-                    var value = String(key);
-                    if (value.indexOf("remote_") === 0) return false;
-                    if (value.indexOf("hg_") === 0) return !!managedKeys[value];
-                    return true;
-                  });
-                  if (selectedKept.length !== selected.length) {
-                    localStorage.setItem("selectedApiSites", JSON.stringify(selectedKept));
-                  }
-                }
-
+              var count = apply(data);
+              try {
+                localStorage.setItem(SYNC_KEY, fingerprint);
+              } catch (error) {
+                // 忽略隐私模式下的写入失败。
+              }
+              if (count > 0) {
                 // 通知已挂载的首页源选择器立即重读，不必刷新页面。
                 window.dispatchEvent(new Event("huangguo-upstreams-updated"));
-              } catch (error) {
-                console.warn("同步上游源列表失败:", error);
               }
             })
             .catch(function () {
-              // 鉴权未通过或网络不可用时保持静默。
+              // 鉴权未通过或网络不可用时保持静默，稍后补一次。
+              if ((attempt || 0) < 1) {
+                setTimeout(function () {
+                  sync((attempt || 0) + 1);
+                }, 1500);
+              }
+            })
+            .then(function () {
+              running = false;
             });
         }
 
+        function start() {
+          sync(0);
+          // 长时间挂着的页面也能跟上池子变化（切回标签页或每 10 分钟）。
+          setInterval(function () {
+            if (document.visibilityState !== "visible") return;
+            sync(0);
+          }, INTERVAL_MS);
+          document.addEventListener("visibilitychange", function () {
+            if (document.visibilityState === "visible") sync(0);
+          });
+        }
+
         if (document.readyState === "complete") {
-          setTimeout(syncUpstreams, 0);
+          setTimeout(start, 0);
         } else {
-          window.addEventListener("load", syncUpstreams, { once: true });
+          window.addEventListener("load", start, { once: true });
         }
       })();
     </script>

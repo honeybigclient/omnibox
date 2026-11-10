@@ -14,6 +14,7 @@ import { ListVideo } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Calendar } from "lucide-react";
 import { fetchWithProxy } from "@/utils/proxy";
+import { hideDuplicateManagedSites } from "@/utils/siteVisibility";
 // --- Interfaces ---
 interface Episode {
   number: string;
@@ -102,6 +103,10 @@ function PlayerPage() {
   const playerRef = useRef<Artplayer | null>(null);
 
   const [availableSources, setAvailableSources] = useState<{ key: string; name: string }[]>([]);
+  // 播放失败自动切源：tried 记录试过的源，避免两个源之间来回跳。
+  const failoverState = useRef({ tried: new Set<string>(), busy: false });
+  const failoverRef = useRef<(reason: string) => void>(() => {});
+  const switchSourceRef = useRef<(key: string) => Promise<void>>(async () => {});
 
   const vodId = searchParams.get("vodId");
   const initialEpNum = searchParams.get("epNum");
@@ -521,17 +526,75 @@ function PlayerPage() {
           m3u8: function playM3u8(video, url, art) {
             if (Hls.isSupported()) {
               if (art.hls) (art.hls as Hls).destroy();
-              const hls = new Hls();
+              const hls = new Hls({
+                manifestLoadingTimeOut: 15000,
+                manifestLoadingMaxRetry: 2,
+                levelLoadingTimeOut: 15000,
+                fragLoadingTimeOut: 20000,
+                fragLoadingMaxRetry: 2,
+              });
               const proxyUrl = localStorage.getItem("m3u8ProxySelected");
               const finalUrl = proxyUrl ? `${proxyUrl}${url}` : url;
+
+              let recovered = false;
+              let lastTime = 0;
+              let lastProgressAt = Date.now();
+              // 分片卡住时 hls.js 往往不报错，只是无限转圈；这里自己看进度。
+              const watchdog = window.setInterval(() => {
+                if (video.paused || video.ended) {
+                  lastProgressAt = Date.now();
+                  return;
+                }
+                if (video.currentTime !== lastTime) {
+                  lastTime = video.currentTime;
+                  lastProgressAt = Date.now();
+                  return;
+                }
+                if (Date.now() - lastProgressAt > 20000) {
+                  window.clearInterval(watchdog);
+                  failoverRef.current("stall");
+                }
+              }, 5000);
+
+              hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                lastProgressAt = Date.now();
+              });
+
+              hls.on(Hls.Events.ERROR, (_event, data) => {
+                if (!data.fatal) return;
+                // 解码类错误先原地恢复一次，还不行再切源。
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
+                  recovered = true;
+                  try {
+                    hls.recoverMediaError();
+                    return;
+                  } catch {
+                    // 恢复失败，继续切源。
+                  }
+                }
+                window.clearInterval(watchdog);
+                try {
+                  hls.destroy();
+                } catch {
+                  // 已经销毁过。
+                }
+                failoverRef.current(`${data.type}/${data.details}`);
+              });
+
               hls.loadSource(finalUrl);
               hls.attachMedia(video);
               art.hls = hls;
-              art.on("destroy", () => hls.destroy());
+              art.on("destroy", () => {
+                window.clearInterval(watchdog);
+                hls.destroy();
+              });
             } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
               const proxyUrl = localStorage.getItem("m3u8ProxySelected");
               const finalUrl = proxyUrl ? `${proxyUrl}${url}` : url;
               video.src = finalUrl;
+              video.addEventListener("error", () =>
+                failoverRef.current("native-hls")
+              );
             } else {
               art.notice.show = "不支持的播放格式: m3u8";
             }
@@ -577,6 +640,21 @@ function PlayerPage() {
         if (skipEnd > 0 && duration - currentTime <= skipEnd) {
           art.seek = duration;
         }
+      });
+
+      let winnerSaved = false;
+      art.on("video:playing", () => {
+        if (winnerSaved || !sourceKey) return;
+        winnerSaved = true;
+        try {
+          localStorage.setItem(`hgPlayWinner:${vodId || ""}`, sourceKey);
+        } catch {
+          // 隐私模式下写不进去，忽略。
+        }
+      });
+
+      art.on("video:error", () => {
+        failoverRef.current("video-error");
       });
 
       playerRef.current = art;
@@ -648,7 +726,7 @@ function PlayerPage() {
     const defaultSites = API_SITES.filter((site) => selectedKeys.includes(site.key));
     const customSites = JSON.parse(localStorage.getItem("customApiSites") || "[]") as ApiSite[];
     const selectedCustomSites = customSites.filter((site) => selectedKeys.includes(site.key));
-    return [...defaultSites, ...selectedCustomSites];
+    return hideDuplicateManagedSites([...defaultSites, ...selectedCustomSites]);
   }, []);
 
   // 搜索其他资源站的相同视频
@@ -745,6 +823,48 @@ function PlayerPage() {
       console.error("Error switching source:", error);
     }
   };
+
+  // 播放失败 → 自动切到下一个有同名剧的源。
+  // hls.js 的错误回调在 player 初始化时注册，这里留一个稳定的入口给它。
+  useEffect(() => {
+    switchSourceRef.current = handleSourceChange;
+    failoverRef.current = (reason: string) => {
+      const state = failoverState.current;
+      if (state.busy) return;
+      if (!movieDetails?.vod_name) return;
+
+      if (sourceKey) state.tried.add(sourceKey);
+      if (state.tried.size > 3) {
+        if (playerRef.current) {
+          playerRef.current.notice.show = `连续 ${state.tried.size} 个源都播放失败，先停一下`;
+        }
+        return;
+      }
+      const next = availableSources.find((site) => !state.tried.has(site.key));
+      if (!next) {
+        if (playerRef.current) {
+          playerRef.current.notice.show = `播放失败（${reason}），没有其他可用源`;
+        }
+        return;
+      }
+
+      state.busy = true;
+      if (playerRef.current) {
+        playerRef.current.notice.show = `播放失败（${reason}），正在切换到「${next.name}」`;
+      }
+      void switchSourceRef.current(next.key).finally(() => {
+        state.busy = false;
+      });
+    };
+  }, [availableSources, movieDetails?.vod_name, sourceKey]);
+
+  // 换源或换剧时重置切源记录，避免把新剧的源当成"已失败"。
+  useEffect(() => {
+    failoverState.current = {
+      tried: new Set(sourceKey ? [sourceKey] : []),
+      busy: false,
+    };
+  }, [sourceKey, vodId]);
 
   // 在视频详情加载完成后搜索其他资源站
   useEffect(() => {

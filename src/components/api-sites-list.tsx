@@ -13,6 +13,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { fetchWithProxy } from "@/utils/proxy";
 import { isAdmin, isAllowedSource } from "@/utils/auth";
+import { hideDuplicateManagedSites } from "@/utils/siteVisibility";
 
 interface ApiSiteStatus {
   key: string;
@@ -74,7 +75,11 @@ const ApiSitesList: React.FC = () => {
 
     // 测试自定义API站点
     try {
-      const customSites = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+      const parsedCustom = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+      // 同名 remote_* 与 hg_* 重复时只显示 hg_*（数据仍留在 localStorage）。
+      const customSites: ApiSite[] = hideDuplicateManagedSites(
+        Array.isArray(parsedCustom) ? parsedCustom : []
+      );
       await Promise.all(
         customSites
           .filter((site: ApiSite) => admin || isAllowedSource(site.key))

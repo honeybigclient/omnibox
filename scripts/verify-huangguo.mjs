@@ -148,6 +148,18 @@ const nativeNoMediaDetail = {
   ],
 };
 
+// 旧站完全失败，但别的上游有同名剧：应自动切换到该上游。
+const nativeFailoverDetail = {
+  list: [
+    {
+      vod_id: 13000,
+      vod_name: "测试短剧 Alpha",
+      vod_pic: "https://img.test/cover.jpg",
+      episodes: [{ ep: 1, title: "第1集", url: "https://site.test/video/13000/ep-1/" }],
+    },
+  ],
+};
+
 // 详情存在但 episodes 为空：应明确报 no_playable，而不是“没有找到内容”。
 const nativeEmptyDetail = {
   list: [
@@ -201,6 +213,56 @@ globalThis.fetch = async (input, init = {}) => {
     return slowResponse(init);
   }
 
+  // 播放代理测试：cdn.test 带 ACAO（可直接连），nocors.test 没有（必须走代理）。
+  if (parsed.hostname === "cdn.test") {
+    if (parsed.pathname === "/play.m3u8") {
+      return new Response(
+        [
+          "#EXTM3U",
+          "#EXT-X-VERSION:3",
+          '#EXT-X-KEY:METHOD=AES-128,URI="/enkey?x=1"',
+          '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="cn",URI="/audio.m3u8"',
+          "#EXTINF:5.0,",
+          "/seg/1.ts",
+          "#EXTINF:5.0,",
+          "https://nocors.test/2.ts",
+          "#EXT-X-ENDLIST",
+          "",
+        ].join("\n"),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Access-Control-Allow-Origin": "*",
+          },
+        }
+      );
+    }
+    if (parsed.pathname === "/audio.m3u8") {
+      return new Response("#EXTM3U\n#EXTINF:5,\n/seg/a.ts\n", {
+        status: 200,
+        headers: {
+          "Content-Type": "application/vnd.apple.mpegurl",
+          "Access-Control-Allow-Origin": "*",
+        },
+      });
+    }
+    return new Response(new Uint8Array([0, 1, 2, 3]), {
+      status: 200,
+      headers: {
+        "Content-Type": "video/mp2t",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
+
+  if (parsed.hostname === "nocors.test") {
+    return new Response(new Uint8Array([0, 1, 2, 3]), {
+      status: 200,
+      headers: { "Content-Type": "video/mp2t" },
+    });
+  }
+
   if (parsed.hostname === "parsebad.test") {
     return new Response("<html><body>not json</body></html>", {
       status: 200,
@@ -214,6 +276,19 @@ globalThis.fetch = async (input, init = {}) => {
 
   if (parsed.hostname === "failnative.test") {
     return new Response("origin down", { status: 522 });
+  }
+
+  if (parsed.hostname === "huangguo.me") {
+    if (parsed.pathname === "/h5/m3u8/test.m3u8") {
+      return new Response(
+        '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="/enkey?x=1"\n#EXTINF:5,\n/seg/1.ts\n',
+        {
+          status: 200,
+          headers: { "Content-Type": "application/vnd.apple.mpegurl" },
+        }
+      );
+    }
+    return new Response("not found", { status: 404 });
   }
 
   if (parsed.hostname === "site.test") {
@@ -237,10 +312,11 @@ globalThis.fetch = async (input, init = {}) => {
     if (parsed.pathname === "/api/detail/12700") return json(nativePageFallbackDetail);
     if (parsed.pathname === "/api/detail/12800") return json(nativeNoMediaDetail);
     if (parsed.pathname === "/api/detail/12900") return json(nativeWorkerPageBugDetail);
+    if (parsed.pathname === "/api/detail/13000") return json(nativeFailoverDetail);
     if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
     if (parsed.pathname === "/api/play") {
       const target = String(parsed.searchParams.get("url") || "");
-      if (target.includes("12700") || target.includes("12800")) {
+      if (target.includes("12700") || target.includes("12800") || target.includes("13000")) {
         return json({ url: "", proxy: "" });
       }
       // 只传数字 id 时模拟 Worker 页面兜底失败；传真实剧集页地址时成功。
@@ -421,6 +497,17 @@ function expect(condition, message) {
   assert.ok(condition, message);
 }
 
+// 播放地址现在一律 302 到本域代理，这里取回代理里的 src 做断言。
+function proxiedSrc(result) {
+  const location = result.response.headers.get("location") || "";
+  if (!location.startsWith("https://app.test/huangguo/hls?")) return "";
+  try {
+    return new URL(location).searchParams.get("src") || "";
+  } catch {
+    return "";
+  }
+}
+
 async function main() {
   console.log("== /huangguo 适配层验证（内存上游，不访问真实网络）==");
 
@@ -481,6 +568,10 @@ async function main() {
     new URL(lazyUrl).searchParams.get("page") === "https://site.test/video/12600/ep-1/",
     "lazy play page hint"
   );
+  expect(
+    new URL(lazyUrl).searchParams.get("title") === "惰性解析测试",
+    "lazy play title hint"
+  );
   expect(result.body.list[0].vod_play_url.split("#").length === 2, "two lazy episodes");
 
   // 6c. 点播时才请求上游 /api/play，并 302 到真实流。
@@ -490,8 +581,8 @@ async function main() {
   console.log(`Location: ${result.response.headers.get("location")}`);
   expect(result.status === 302, "play 302");
   expect(
-    result.response.headers.get("location") === "https://cdn.test/play.m3u8",
-    "play location"
+    proxiedSrc(result) === "https://cdn.test/play.m3u8",
+    "play location proxied"
   );
 
   // 6d. Worker /api/play 返回空时，回退到详情页 videoInitialData。
@@ -505,8 +596,8 @@ async function main() {
   console.log(`Location: ${result.response.headers.get("location")}`);
   expect(result.status === 302, "page fallback 302");
   expect(
-    result.response.headers.get("location") === "https://cdn.test/from-page.m3u8",
-    "page fallback location"
+    proxiedSrc(result) === "https://cdn.test/from-page.m3u8",
+    "page fallback location proxied"
   );
 
   // 6f. 所有兜底都失败时，502 JSON 必须带 attempts。
@@ -524,6 +615,10 @@ async function main() {
     result.body.attempts.some((item) => item.step === "worker-play" && item.ok === false),
     "worker attempt visible"
   );
+  expect(
+    Array.isArray(result.body.tried) && result.body.tried.includes("alpha"),
+    "failover candidates tried"
+  );
 
   // 6h. 真实 Worker 缺陷模拟：详情页地址必须出现在惰性 URL 里。
   path = "/huangguo/api.php/provide/vod/?ac=detail&ids=12900";
@@ -540,8 +635,8 @@ async function main() {
   console.log(`Location: ${result.response.headers.get("location")}`);
   expect(result.status === 302, "worker page bug 302");
   expect(
-    result.response.headers.get("location") === "https://cdn.test/from-page-12900.m3u8",
-    "worker page bug location"
+    proxiedSrc(result) === "https://cdn.test/from-page-12900.m3u8",
+    "worker page bug location proxied"
   );
 
   // 6j. 旧惰性 URL 没有 page 时，v3 会自动回详情取 page，仍然能播。
@@ -551,9 +646,66 @@ async function main() {
   console.log(`Location: ${result.response.headers.get("location")}`);
   expect(result.status === 302, "legacy lazy 302");
   expect(
-    result.response.headers.get("location") === "https://cdn.test/from-page-12900.m3u8",
-    "legacy lazy location"
+    proxiedSrc(result) === "https://cdn.test/from-page-12900.m3u8",
+    "legacy lazy location proxied"
   );
+
+  // 6k. 播放代理：m3u8 改写 + key/分片按 CORS 能力直连或代理。
+  const hlsPath =
+    "/huangguo/hls?src=" +
+    encodeURIComponent("https://cdn.test/play.m3u8") +
+    "&ref=" +
+    encodeURIComponent("https://site.test/");
+  result = await call(hlsPath);
+  await show("6k. 播放代理改写 m3u8", hlsPath, result);
+  expect(result.status === 200, "hls 200");
+  expect(
+    String(result.response.headers.get("content-type")).includes("mpegurl"),
+    "hls content type"
+  );
+  expect(
+    result.response.headers.get("access-control-allow-origin") === "*",
+    "hls cors"
+  );
+  const playlist = result.text;
+  expect(playlist.startsWith("#EXTM3U"), "playlist passthrough");
+  expect(
+    playlist.includes('URI="https://cdn.test/enkey?x=1"'),
+    "key direct when CORS ok"
+  );
+  expect(
+    playlist.includes("https://cdn.test/seg/1.ts"),
+    "segment direct when CORS ok"
+  );
+  expect(
+    playlist.includes("/huangguo/hls?src=https%3A%2F%2Fnocors.test%2F2.ts"),
+    "no-cors segment proxied"
+  );
+  expect(
+    playlist.includes("/huangguo/hls?src=https%3A%2F%2Fcdn.test%2Faudio.m3u8"),
+    "nested playlist proxied"
+  );
+
+  // 6l. 旧站彻底失败时，按剧名自动切到有同名剧的上游。
+  path =
+    "/huangguo/play.m3u8?up=huangguo-web&id=13000&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/13000/ep-1/") +
+    "&title=" +
+    encodeURIComponent("测试短剧 Alpha");
+  result = await call(path);
+  await show("6l. 上游失败自动切到 alpha", path, result);
+  expect(result.status === 302, "failover 302");
+  expect(
+    proxiedSrc(result) === "https://alpha.test/1.m3u8",
+    "failover to alpha play url"
+  );
+
+  // 6m. 详情响应附带候选上游，供前端切源使用。
+  path = "/huangguo/api.php/provide/vod/?ac=detail&ids=13000";
+  result = await call(path);
+  const candidates = result.body.list[0].upstream_candidates;
+  expect(Array.isArray(candidates) && candidates.length >= 2, "detail candidates");
+  expect(candidates[0].slug === "huangguo-web", "candidate prefers requested upstream");
 
   // 7. MacCMS 上游按 slug 路由 + ac=list。
   path = "/huangguo/api.php/provide/vod/?ac=list&slug=alpha";
@@ -608,6 +760,29 @@ async function main() {
   expect(result.body.error.kind === "no_playable", "empty episodes kind");
   expect(result.body.error.details.episodes === 0, "empty episodes details");
   expect(result.body.msg.includes("episodes 为空"), "empty episodes concrete msg");
+
+  // 11c. 新站 m3u8 代理：相对 key/分片必须改写成绝对地址。
+  path =
+    "/huangguo/m3u8?src=" +
+    encodeURIComponent("https://huangguo.me/h5/m3u8/test.m3u8") +
+    "&ref=" +
+    encodeURIComponent("https://huangguo.me/play/qmnslgqb/29680/");
+  result = await call(path);
+  await show("11c. 新站 m3u8 代理重写", path, result);
+  expect(result.status === 200, "m3u8 proxy 200");
+  expect(
+    result.response.headers.get("content-type").includes("mpegurl"),
+    "m3u8 proxy content type"
+  );
+  // 新站没有 CORS 头：key 和分片都必须走本域代理，否则 hls.js 解不出分片。
+  expect(
+    result.text.includes("/huangguo/hls?src=https%3A%2F%2Fhuangguo.me%2Fenkey%3Fx%3D1"),
+    "m3u8 key proxied when no CORS"
+  );
+  expect(
+    result.text.includes("/huangguo/hls?src=https%3A%2F%2Fhuangguo.me%2Fseg%2F1.ts"),
+    "m3u8 segment proxied when no CORS"
+  );
 
   // 12. 图片代理保持可用。
   path = "/huangguo/media?src=https%3A%2F%2Fimg.test%2Fcover.jpg&up=huangguo-web";

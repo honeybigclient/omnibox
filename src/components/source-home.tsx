@@ -6,6 +6,7 @@ import { fetchWithProxy } from "@/utils/proxy";
 import { RouterUtils } from "@/utils/router";
 import type { ApiSite } from "@/types/apiSite";
 import { filterAllowedSites } from "@/utils/auth";
+import { hideDuplicateManagedSites } from "@/utils/siteVisibility";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -86,7 +87,7 @@ function buildSources(): ApiSite[] {
     seen.add(normalized);
     return true;
   });
-  return filterAllowedSites(unique);
+  return filterAllowedSites(hideDuplicateManagedSites(unique));
 }
 
 function posterUrl(raw: string | undefined, site: ApiSite | undefined): string {

@@ -40,11 +40,10 @@ async function syncAllowedSources() {
     }
 
     const extraKeys = new Set<string>(extras.map((site: ApiSite) => site.key));
+    // 只去掉 /api/sources 已经重新下发的 key；其余本地源（含 remote_*）
+    // 一律保留，避免服务端同步把用户自己的源冲掉。
     const kept = existing.filter(
-      (site) =>
-        site?.key &&
-        !String(site.key).startsWith("remote_") &&
-        !extraKeys.has(site.key)
+      (site) => site?.key && !extraKeys.has(site.key)
     );
 
     // 保留本地 huangguo / hg_* 源，并按 key 去重，避免 /api/sources 同步时把它们冲掉。

@@ -8,7 +8,13 @@
  *   /huangguo/api.php/provide/vod/?ac=upstreams       (诊断)
  *   /huangguo/api.php/provide/vod/?ac=huangguome      (新站播放诊断)
  *   /huangguo/media?src=...                            (图片代理)
- *   /huangguo/m3u8?src=...                             (新站播放列表代理)
+ *   /huangguo/hls?src=...&ref=...                      (播放代理：m3u8 改写 +
+ *                                                       key/分片透传，兜住 CORS)
+ *   /huangguo/m3u8?src=...                             (同 hls，保留旧链接)
+ *
+ * 播放入口 /huangguo/play.m3u8 不再 302 裸地址，而是 302 到 /huangguo/hls，
+ * 由 Worker 代理取流；这是修复"一直转圈"的关键。解析失败时会按健康度
+ * 自动换下一个上游重试，尽量不让用户看到空播放器。
  *
  * 上游池由三部分组成：
  *   1. 黄果 spider 里的 API / SITE（原生 Worker JSON 接口）；
@@ -1291,8 +1297,9 @@ function playAttemptError(error) {
  * → 源站官方接口 → 剧集页 videoInitialData/m3u8。
  * 每次失败都记录 attempts，最终 502 JSON 会带上，方便定位。
  */
-async function resolveNativePlay(upstream, id, ep, env, pageHint) {
-  const deadline = Date.now() + 25000;
+async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
+  const budget = clamp(Number(budgetMs) || 25000, 2500, 30000);
+  const deadline = Date.now() + budget;
   const remaining = (max) =>
     Math.max(1000, Math.min(max || 25000, deadline - Date.now()));
   const attempts = [];
@@ -2053,7 +2060,18 @@ async function handleDetail(url, pool, env) {
       });
     }
 
-    const vod = { ...result.vod, vod_id: parsed.displayId };
+    // 附带一份候选上游（按健康度/延迟排序），前端切源时可以直接用。
+    const candidates = rankedUpstreams(pool, upstream).map((item) => ({
+      slug: item.slug,
+      name: item.name,
+      kind: item.kind,
+      status: statusOf(item),
+    }));
+    const vod = {
+      ...result.vod,
+      vod_id: parsed.displayId,
+      upstream_candidates: candidates,
+    };
     return jsonResponse({
       code: 1,
       msg: "数据列表",
@@ -2397,106 +2415,264 @@ function isAllowedHuangguoMeHost(hostname) {
 }
 
 /**
- * huangguo.me 的 m3u8 本身没有 CORS 头，不能直接交给浏览器 Hls.js；
- * 这里只代理播放列表，并把 key/variant URI 改成绝对地址。
- * 分片域名（webats.rlkfus.cn）实测带 Access-Control-Allow-Origin: *，继续直连。
+ * 播放代理（解决"一直转圈"的核心）。
+ *
+ * 背景：原生黄果站的 m3u8 / 分片 / AES key 都没有 CORS 头，302 直跳裸地址后
+ * hls.js 的 manifest 或 key 请求会被浏览器拦下来，表现就是无限转圈；而
+ * huangguo.me 新站同样没有 CORS。所以播放地址一律先跳回本域 /huangguo/hls，
+ * 由 Worker 拉取后再返回给浏览器：
+ *
+ *   - 播放列表（m3u8）：改写所有 URI。子播放列表继续走代理；key 和分片只在
+ *     探测到目标域名确实带 Access-Control-Allow-Origin 时才直连，否则也走
+ *     代理。探测结果按域名缓存 6 小时，避免每次播放都重新探测。
+ *   - 分片 / key / mp4：原样透传，保留 Range 与 206 状态码，并补上 CORS 头。
+ *
+ * 代理地址只接受 http(s) src，且不携带任何用户凭据，避免被当成开放代理滥用。
  */
-async function handleM3u8(url) {
-  const src = url.searchParams.get("src") || "";
-  const ref = url.searchParams.get("ref") || `${HUANGGUO_ME}/`;
 
-  if (!isHttpUrl(src)) {
-    return jsonResponse({ error: "缺少有效的 m3u8 地址" }, 400);
+const CORS_PROBE_TTL_SECONDS = 6 * 60 * 60;
+const CORS_MEMO_TTL_MS = 10 * 60 * 1000;
+const corsMemo = new Map(); // origin -> { value, at }
+
+function streamProxyUrl(origin, src, referer) {
+  const params = new URLSearchParams({ src: String(src) });
+  if (referer) params.set("ref", String(referer));
+  return `${origin}/huangguo/hls?${params.toString()}`;
+}
+
+function isPlaylistResponse(response, sourceUrl) {
+  const type = String(response.headers.get("content-type") || "").toLowerCase();
+  if (type.includes("mpegurl")) return true;
+  // 有些 CDN 用 text/plain / octet-stream 发 m3u8，这时按扩展名兜底。
+  if (!type || type.includes("text/plain") || type.includes("octet-stream")) {
+    return /\.m3u8(\?|#|$)/i.test(String(sourceUrl));
   }
+  return false;
+}
 
-  let srcUrl;
+function classifyPlaylistUri(absUrl, origin) {
+  if (!isHttpUrl(absUrl)) return "raw";
+  let url;
   try {
-    srcUrl = new URL(src);
+    url = new URL(absUrl);
   } catch {
-    return jsonResponse({ error: "m3u8 地址无效" }, 400);
+    return "raw";
   }
-  if (!isAllowedHuangguoMeHost(srcUrl.hostname)) {
-    return jsonResponse({ error: "不允许的 m3u8 域名" }, 400);
+  if (url.origin === origin) return "self";
+  if (/\.m3u8(\?|#|$)/i.test(`${url.pathname}${url.search}`)) return "playlist";
+  return "asset";
+}
+
+async function hostAllowsCors(sourceOrigin, sampleUrl, referer, env) {
+  const memo = corsMemo.get(sourceOrigin);
+  if (memo && Date.now() - memo.at < CORS_MEMO_TTL_MS) return memo.value;
+
+  const cacheUrl = `https://huangguo.internal/__cors_v2/${encodeURIComponent(
+    sourceOrigin
+  )}`;
+  if (typeof caches !== "undefined" && caches.default) {
+    try {
+      const hit = await caches.default.match(cacheUrl);
+      if (hit) {
+        const value = (await hit.text()) === "1";
+        corsMemo.set(sourceOrigin, { value, at: Date.now() });
+        return value;
+      }
+    } catch {
+      // 缓存不可用时继续探测。
+    }
   }
 
-  let referer = `${HUANGGUO_ME}/`;
+  let allowed = false;
   try {
-    const refUrl = new URL(ref);
-    if (isAllowedHuangguoMeHost(refUrl.hostname)) referer = refUrl.toString();
-  } catch {
-    // 使用默认 Referer。
-  }
-
-  let response;
-  try {
-    response = await fetchWithTimeout(
-      src,
+    const response = await fetchWithTimeout(
+      sampleUrl,
       {
         headers: {
           "User-Agent": UA,
-          Referer: referer,
-          Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+          Referer: referer || `${sourceOrigin}/`,
+          Accept: "*/*",
+          Range: "bytes=0-0",
         },
       },
-      15000
+      4000
     );
-  } catch (error) {
-    return jsonResponse(
-      { error: "m3u8 拉取失败", message: error && error.message },
-      502
-    );
+    const acao = String(
+      response.headers.get("access-control-allow-origin") || ""
+    ).trim();
+    allowed = !!acao;
+  } catch {
+    allowed = false;
   }
 
-  if (!response.ok) {
-    return jsonResponse(
-      { error: `上游 m3u8 返回 HTTP ${response.status}` },
-      502
-    );
+  corsMemo.set(sourceOrigin, { value: allowed, at: Date.now() });
+  if (typeof caches !== "undefined" && caches.default) {
+    try {
+      await caches.default.put(
+        cacheUrl,
+        new Response(allowed ? "1" : "0", {
+          headers: {
+            "Content-Type": "text/plain",
+            "Cache-Control": `max-age=${CORS_PROBE_TTL_SECONDS}`,
+          },
+        })
+      );
+    } catch {
+      // 写入失败不影响本次播放。
+    }
   }
+  return allowed;
+}
 
-  const text = await response.text();
-  if (!text.trimStart().startsWith("#EXTM3U")) {
-    return jsonResponse({ error: "上游返回的不是 m3u8" }, 502);
-  }
-
+async function rewritePlaylist(text, sourceUrl, origin, referer, env) {
+  const base = String(sourceUrl);
   const absolutize = (value) => {
     try {
-      return new URL(value, src).toString();
+      return new URL(value, base).toString();
     } catch {
       return value;
     }
   };
-  const proxyUrl = (value) =>
-    `${url.origin}/huangguo/m3u8?src=${encodeURIComponent(
-      value
-    )}&ref=${encodeURIComponent(referer)}`;
 
-  const rewritten = text
+  // 第一遍：找出每个远端域名的样本地址（取第一个 key/分片），只探测这些域名。
+  const samples = new Map();
+  const collect = (absUrl) => {
+    if (classifyPlaylistUri(absUrl, origin) !== "asset") return;
+    try {
+      const { origin: remote } = new URL(absUrl);
+      if (!samples.has(remote)) samples.set(remote, absUrl);
+    } catch {
+      // 忽略无法解析的地址。
+    }
+  };
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith("#")) {
+      for (const match of trimmed.matchAll(/URI="([^"]+)"/g)) {
+        collect(absolutize(match[1]));
+      }
+    } else {
+      collect(absolutize(trimmed));
+    }
+  }
+
+  const directOrigins = new Set();
+  await Promise.all(
+    [...samples.entries()].slice(0, 6).map(async ([remoteOrigin, sample]) => {
+      if (await hostAllowsCors(remoteOrigin, sample, referer, env)) {
+        directOrigins.add(remoteOrigin);
+      }
+    })
+  );
+
+  const render = (raw) => {
+    const absUrl = absolutize(raw);
+    const kind = classifyPlaylistUri(absUrl, origin);
+    if (kind === "playlist") return streamProxyUrl(origin, absUrl, referer);
+    if (kind === "asset") {
+      const remoteOrigin = new URL(absUrl).origin;
+      if (directOrigins.has(remoteOrigin)) return absUrl;
+      return streamProxyUrl(origin, absUrl, referer);
+    }
+    return absUrl;
+  };
+
+  return text
     .split(/\r?\n/)
     .map((line) => {
       const trimmed = line.trim();
       if (!trimmed) return line;
       if (trimmed.startsWith("#")) {
-        return line.replace(/URI="([^"]+)"/g, (match, uri) => {
-          const abs = absolutize(uri);
-          return `URI="${
-            /\.m3u8(\?|#|$)/i.test(abs) ? proxyUrl(abs) : abs
-          }"`;
-        });
+        return line.replace(
+          /URI="([^"]+)"/g,
+          (match, uri) => `URI="${render(uri)}"`
+        );
       }
-      const abs = absolutize(trimmed);
-      if (/\.m3u8(\?|#|$)/i.test(abs)) return proxyUrl(abs);
-      return abs;
+      return render(trimmed);
     })
     .join("\n");
+}
 
-  return new Response(rewritten, {
-    headers: {
-      ...CORS,
-      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
-      "Cache-Control": "no-store",
-    },
-  });
+async function handleStream(url, request, env) {
+  const src = String(url.searchParams.get("src") || "").trim();
+  const ref = String(url.searchParams.get("ref") || "").trim();
+
+  if (!isHttpUrl(src)) {
+    return jsonResponse({ error: "缺少有效的播放地址" }, 400);
+  }
+  let srcUrl;
+  try {
+    srcUrl = new URL(src);
+  } catch {
+    return jsonResponse({ error: "播放地址无效" }, 400);
+  }
+  if (!/^https?:$/.test(srcUrl.protocol)) {
+    return jsonResponse({ error: "不支持的播放地址协议" }, 400);
+  }
+
+  const referer = isHttpUrl(ref) ? ref : `${srcUrl.origin}/`;
+  const headers = {
+    "User-Agent": UA,
+    Referer: referer,
+    Accept: "*/*",
+  };
+  const range = request && request.headers ? request.headers.get("range") : null;
+  if (range) headers.Range = range;
+
+  let response;
+  try {
+    response = await fetchWithTimeout(src, { headers }, 15000);
+  } catch (error) {
+    return jsonResponse(
+      { error: "拉取播放地址失败", message: error && error.message, src },
+      502
+    );
+  }
+
+  if (!response.ok && response.status !== 206) {
+    return jsonResponse({ error: `上游返回 HTTP ${response.status}`, src }, 502);
+  }
+
+  if (isPlaylistResponse(response, src)) {
+    const text = await response.text();
+    if (!text.trimStart().startsWith("#EXTM3U")) {
+      return jsonResponse({ error: "上游返回的不是 m3u8", src }, 502);
+    }
+    const rewritten = await rewritePlaylist(
+      text,
+      src,
+      url.origin,
+      referer,
+      env
+    );
+    return new Response(rewritten, {
+      headers: {
+        ...CORS,
+        "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    });
+  }
+
+  // 分片 / key / mp4：透传，保留 Range 语义，补 CORS。
+  // 用 private 而不是 public：这个路径挂在鉴权后面，不要被边缘缓存成公共资源。
+  const out = new Headers(CORS);
+  for (const name of [
+    "content-type",
+    "content-length",
+    "content-range",
+    "accept-ranges",
+    "etag",
+    "last-modified",
+  ]) {
+    const value = response.headers.get(name);
+    if (value) out.set(name, value);
+  }
+  out.set("Cache-Control", "private, max-age=300");
+  const body =
+    request && request.method === "HEAD" ? null : response.body;
+  return new Response(body, { status: response.status, headers: out });
 }
 
 async function handleHuangguoMe(url, env) {
@@ -2536,6 +2712,178 @@ async function handleHuangguoMe(url, env) {
   });
 }
 
+/* -------------------------------------------------------------------------- */
+/* 选源（健康度 + 延迟加权）与跨上游兜底                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 上游健康分：越高的越先试。
+ * 成功次数、延迟加分；失败次数、连续失败扣分；熔断中的直接排到最后。
+ */
+function healthScore(upstream) {
+  const state = healthState.get(upstream.slug);
+  if (!state) return 50;
+  if (state.circuitOpenUntil > Date.now()) return -100;
+
+  let score = 60;
+  score += Math.min(state.successes, 10) * 2;
+  score -= Math.min(state.failures, 10) * 3;
+  score -= Math.min(state.consecutiveFailures, 5) * 15;
+  if (state.latencyMs) score += Math.max(0, 40 - state.latencyMs / 250);
+  return Math.round(score);
+}
+
+function rankedUpstreams(pool, preferred) {
+  if (!pool || !pool.upstreams.length) return [];
+  const ordered = pool.upstreams
+    .map((upstream) => ({ upstream, score: healthScore(upstream) }))
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.upstream);
+
+  if (!preferred) return ordered.slice(0, 4);
+  const rest = ordered.filter((item) => item.slug !== preferred.slug);
+  // 用户点名的上游先试，其余按分数最多再带 3 个做兜底。
+  return [preferred, ...rest.slice(0, 3)];
+}
+
+function pickTitleMatch(items, title) {
+  let best = null;
+  let bestScore = -1;
+  for (const item of items) {
+    const score = titleScore(
+      title,
+      item.vod_name || item.name || item.title || ""
+    );
+    if (score > bestScore) {
+      bestScore = score;
+      best = item;
+    }
+  }
+  return bestScore >= 60 ? best : null;
+}
+
+/** 按剧名在 MacCMS 上游里找同一部剧，并取第 ep 集的播放地址。 */
+async function maccmsPlayByTitle(upstream, title, ep, env) {
+  const attempts = [];
+  const search = await requestUpstreamJson(
+    upstream,
+    maccmsUrl(upstream, { ac: "videolist", wd: title, pg: 1 }),
+    env,
+    { timeoutMs: 6000 }
+  );
+  const items = Array.isArray(search.data.list) ? search.data.list : [];
+  const match = pickTitleMatch(items, title);
+  attempts.push({
+    step: `${upstream.slug}-search`,
+    ok: !!match,
+    status: search.status,
+    matched: match ? String(match.vod_name || "") : "",
+  });
+  if (!match) {
+    throw new UpstreamError(upstream, "not_found", "该上游没有同名资源", {
+      status: search.status,
+    });
+  }
+
+  const detail = await requestUpstreamJson(
+    upstream,
+    maccmsUrl(upstream, { ac: "detail", ids: match.vod_id }),
+    env,
+    { timeoutMs: 6000 }
+  );
+  const item = (Array.isArray(detail.data.list) && detail.data.list[0]) || null;
+  const parts = String((item && item.vod_play_url) || "")
+    .split("#")
+    .filter(Boolean);
+  const index = Math.max(0, (Number(ep) || 1) - 1);
+  const selected = parts[index] || parts[0] || "";
+  const url = String(
+    selected.includes("$") ? selected.split("$").slice(1).join("$") : selected
+  ).trim();
+  attempts.push({
+    step: `${upstream.slug}-detail`,
+    ok: isHttpUrl(url),
+    status: detail.status,
+    episodes: parts.length,
+  });
+
+  return { url, referer: refererOf(upstream), attempts };
+}
+
+async function resolveCandidatePlay(candidate, ctx) {
+  const { id, ep, pageHint, title, env } = ctx;
+
+  if (candidate.kind === "huangguo") {
+    const native = await resolveNativePlay(
+      candidate,
+      id,
+      ep,
+      env,
+      pageHint,
+      ctx.budgetMs
+    );
+    if (isHttpUrl(native.url)) {
+      return {
+        url: native.url,
+        referer: refererOf(candidate),
+        attempts: native.attempts,
+      };
+    }
+
+    // 旧站失败 → 按剧名去新站兜底。
+    if (title) {
+      const me = await resolveHuangguoMeByTitle(title, ep, env);
+      const attempts = [...native.attempts, ...me.attempts];
+      if (isHttpUrl(me.stream)) {
+        attempts.push({
+          step: "huangguo-me-proxy",
+          ok: true,
+          playPage: me.playPage,
+        });
+        return {
+          url: me.stream,
+          referer: me.playPage || `${HUANGGUO_ME}/`,
+          attempts,
+        };
+      }
+      return { url: "", referer: "", attempts };
+    }
+    return { url: "", referer: "", attempts: native.attempts };
+  }
+
+  if (candidate.kind === "huangguo-me") {
+    if (!title) {
+      return {
+        url: "",
+        referer: "",
+        attempts: [{ step: "huangguo-me", ok: false, reason: "缺少剧名" }],
+      };
+    }
+    const me = await resolveHuangguoMeByTitle(title, ep, env);
+    return {
+      url: me.stream,
+      referer: me.playPage || `${HUANGGUO_ME}/`,
+      attempts: me.attempts,
+    };
+  }
+
+  if (!title) {
+    return {
+      url: "",
+      referer: "",
+      attempts: [
+        {
+          step: candidate.slug,
+          ok: false,
+          reason: "缺少剧名，无法跨站匹配",
+        },
+      ],
+    };
+  }
+
+  return maccmsPlayByTitle(candidate, title, ep, env);
+}
+
 async function handlePlay(url, pool, env) {
   const id = String(url.searchParams.get("id") || "").trim();
   const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
@@ -2553,111 +2901,122 @@ async function handlePlay(url, pool, env) {
     );
   }
 
-  // 旧站先解析；800ms 后还没结果再并行启动新站兜底。
-  // 旧站很快成功时不会白白请求 huangguo.me；旧站慢时新站已经准备好。
-  let mePromise = null;
-  const startMe = () => {
-    if (!mePromise && upstream.kind === "huangguo" && title) {
-      mePromise = resolveHuangguoMeByTitle(title, ep, env).catch((error) => ({
-        stream: "",
-        playPage: "",
-        title: "",
-        attempts: [
-          { step: "huangguo-me", ok: false, ...playAttemptError(error) },
-        ],
-      }));
+  const candidates = rankedUpstreams(pool, upstream);
+  const deadline = Date.now() + 18000;
+  const attempts = [];
+  let lastError = null;
+
+  for (const candidate of candidates) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 800) {
+      attempts.push({
+        step: candidate.slug,
+        ok: false,
+        reason: "解析总耗时超时，未尝试",
+      });
+      continue;
     }
-    return mePromise;
-  };
-  const meTimer =
-    upstream.kind === "huangguo" && title ? setTimeout(startMe, 800) : null;
-
-  let attempts = [];
-  try {
-    let target = "";
-
-    if (upstream.kind === "huangguo") {
-      const resolved = await resolveNativePlay(upstream, id, ep, env, pageHint);
-      target = resolved.url;
-      attempts = resolved.attempts;
-    } else {
-      const detail = await maccmsDetail(upstream, id, url.origin, env);
-      if (detail.status === "ok") {
-        const parts = String(detail.vod.vod_play_url || "").split("#");
-        const index = Math.max(0, (Number(ep) || 1) - 1);
-        const selected = parts[index] || parts[0] || "";
-        target = selected.includes("$")
-          ? selected.split("$").slice(1).join("$")
-          : selected;
-      }
+    if (candidate !== upstream && isCircuitOpen(candidate)) {
+      attempts.push({
+        step: candidate.slug,
+        ok: false,
+        reason: "熔断冷却中",
+      });
+      continue;
     }
 
-    // 旧站三层兜底都失败后，按剧名去 huangguo.me 新站找同一部剧。
-    if (!isHttpUrl(target) && upstream.kind === "huangguo") {
-      if (startMe()) {
-        const me = await startMe();
-        attempts.push(...me.attempts);
-        if (isHttpUrl(me.stream)) {
-          target = `${url.origin}/huangguo/m3u8?src=${encodeURIComponent(
-            me.stream
-          )}&ref=${encodeURIComponent(me.playPage || `${HUANGGUO_ME}/`)}`;
-          attempts.push({
-            step: "huangguo-me-proxy",
-            ok: true,
-            playPage: me.playPage,
-          });
-        }
-      } else {
+    const started = Date.now();
+    try {
+      const result = await resolveCandidatePlay(candidate, {
+        id,
+        ep,
+        pageHint,
+        title,
+        env,
+        budgetMs: Math.max(3000, Math.min(12000, remaining)),
+      });
+      attempts.push(...result.attempts);
+
+      if (isHttpUrl(result.url)) {
+        // 一律经由本域代理，把 CORS / Referer / Range 问题收进 Worker 里，
+        // 不再把裸 m3u8 直接丢给 hls.js（那是无限转圈的根源）。
+        const proxy = streamProxyUrl(url.origin, result.url, result.referer);
         attempts.push({
-          step: "huangguo-me",
-          ok: false,
-          reason: "旧播放地址没有 title 参数，无法用新站兜底",
+          step: `${candidate.slug}-proxy`,
+          ok: true,
+          upstream: candidate.slug,
+          ms: Date.now() - started,
+        });
+        return new Response(null, {
+          status: 302,
+          headers: {
+            ...CORS,
+            Location: proxy,
+            "Cache-Control": "no-store",
+          },
         });
       }
-    }
 
-    if (!isHttpUrl(target)) {
-      return jsonResponse(
-        {
-          code: 0,
-          msg: "上游没有返回可播放地址",
-          kind: "no_playable",
-          upstream: upstream.slug,
-          attempts,
-          list: [],
-        },
-        502
-      );
+      attempts.push({
+        step: `${candidate.slug}-resolve`,
+        ok: false,
+        upstream: candidate.slug,
+        ms: Date.now() - started,
+        reason: "没有拿到可播放地址",
+      });
+    } catch (error) {
+      lastError = error;
+      const err =
+        error instanceof UpstreamError
+          ? error
+          : new UpstreamError(
+              candidate,
+              "upstream",
+              String(error && error.message)
+            );
+      attempts.push({
+        step: candidate.slug,
+        ok: false,
+        upstream: candidate.slug,
+        ...playAttemptError(err),
+      });
     }
-
-    return new Response(null, {
-      status: 302,
-      headers: {
-        ...CORS,
-        Location: target,
-        "Cache-Control": "no-store",
-      },
-    });
-  } catch (error) {
-    const err =
-      error instanceof UpstreamError
-        ? error
-        : new UpstreamError(upstream, "upstream", String(error && error.message));
-    return jsonResponse(
-      {
-        code: 0,
-        msg: errorMessage(err),
-        kind: err.kind,
-        upstream: err.upstream,
-        detail: err.toJSON(),
-        attempts,
-        list: [],
-      },
-      502
-    );
-  } finally {
-    if (meTimer) clearTimeout(meTimer);
   }
+
+  // 区分两类失败：上游整体不可用（熔断/超时/HTTP）报具体原因；
+  // 上游都能访问、只是没有片源时报 no_playable，并说清试过几个源。
+  const systemicKinds = new Set([
+    "circuit_open",
+    "http",
+    "timeout",
+    "upstream",
+    "parse",
+    "abort",
+  ]);
+  const systemic = attempts.find((item) => {
+    if (item.ok !== false) return false;
+    const kind = String(item.kind || "");
+    if (!systemicKinds.has(kind)) return false;
+    // 404 只说明那家没有这条资源，不算上游故障。
+    if (kind === "http" && Number(item.status) === 404) return false;
+    return true;
+  });
+  const tried = candidates.map((item) => item.slug);
+
+  return jsonResponse(
+    {
+      code: 0,
+      msg: systemic
+        ? errorMessage(lastError)
+        : `上游没有返回可播放地址（已尝试 ${tried.length} 个上游）`,
+      kind: systemic ? systemic.kind : "no_playable",
+      upstream: upstream.slug,
+      tried,
+      attempts,
+      list: [],
+    },
+    502
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2687,11 +3046,14 @@ export async function onRequest(context) {
     mediaPath.endsWith("/huangguo/play") ||
     mediaPath.endsWith("/huangguo/play.m3u8");
   const isM3u8 =
-    mediaPath === "/huangguo/m3u8" || mediaPath.endsWith("/huangguo/m3u8");
+    mediaPath === "/huangguo/m3u8" ||
+    mediaPath.endsWith("/huangguo/m3u8") ||
+    mediaPath === "/huangguo/hls" ||
+    mediaPath.endsWith("/huangguo/hls");
 
-  // 新站 m3u8 代理和诊断不需要上游池。
+  // 播放代理和诊断不需要上游池。
   if (isM3u8) {
-    return handleM3u8(url);
+    return handleStream(url, request, env);
   }
 
   if (ac === "huangguome") {

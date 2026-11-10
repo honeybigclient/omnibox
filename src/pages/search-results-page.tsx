@@ -11,6 +11,7 @@ import { isAllowedSource } from "@/utils/auth";
 import { Movie, ApiSite } from "@/types/index";
 import { RouterUtils } from "@/utils/router";
 import { fetchWithProxy } from "@/utils/proxy";
+import { hideDuplicateManagedSites } from "@/utils/siteVisibility";
 import noImg from "@/assets/no-img.svg";
 import * as cheerio from "cheerio";
 
@@ -469,9 +470,10 @@ export default function SearchResultsPage() {
     try {
       // 搜索所有有权限的源，而不只是当前勾选的源
       const defaultSites = API_SITES.filter((site) => isAllowedSource(site.key));
-      const customSites = JSON.parse(
-        localStorage.getItem("customApiSites") || "[]"
-      ) as ApiSite[];
+      // 同名 remote_* 与 hg_* 重复时只保留 hg_*，避免重复请求/重复结果。
+      const customSites = hideDuplicateManagedSites(
+        JSON.parse(localStorage.getItem("customApiSites") || "[]") as ApiSite[]
+      );
       // hg_* 是 /huangguo 下的子源，默认 huangguo 源一次请求就会合并搜索，
       // 不要再让浏览器为每个子源单独发一次请求。
       const allowedCustomSites = customSites.filter(
