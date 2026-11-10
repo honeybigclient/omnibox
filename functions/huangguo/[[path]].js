@@ -13,6 +13,7 @@
  *   /huangguo/m3u8?src=...                             (同 hls，保留旧链接)
  *   /huangguo/api.php/provide/vod/?ac=playdebug         (播放解析诊断)
  *   /huangguo/api.php/provide/vod/?ac=playprobe         (多种请求姿势探测)
+ *   /huangguo/api.php/provide/vod/?ac=playcheck         (批量片源自检)
  *
  * 播放入口 /huangguo/play.m3u8 不再 302 裸地址，而是 302 到 /huangguo/hls，
  * 由 Worker 代理取流；这是修复"一直转圈"的关键。解析失败时会按健康度
@@ -184,6 +185,21 @@ function namespaceId(upstream, id) {
   if (!raw) return "";
   const prefix = `${upstream.slug}~`;
   return raw.startsWith(prefix) ? raw : `${prefix}${raw}`;
+}
+
+/**
+ * 前端拿到的 vod_id 是 `slug~id` 形式（跨站防冲突）。正常链路上我们会先剥离，
+ * 但只要这个值从别处漏进播放参数（手动拼 URL、历史记录、第三方调用），
+ * 上游就会回"无效的 ID"。这里做一次兜底剥离，id 和 page 都过一遍。
+ */
+function stripNamespace(pool, value) {
+  let out = String(value == null ? "" : value);
+  if (!out || !pool || !Array.isArray(pool.upstreams)) return out;
+  for (const upstream of pool.upstreams) {
+    const prefix = `${upstream.slug}~`;
+    if (out.includes(prefix)) out = out.split(prefix).join("");
+  }
+  return out;
 }
 
 function lazyPlayUrl(origin, upstream, id, ep, pageUrl, title) {
@@ -1508,12 +1524,20 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
       attempts.push({ step: "worker-play", ok: true, via: "deep", status, ms });
       return { url: deepWorker, attempts };
     }
+    const declared = Number((data && data.declaredDuration) || 0);
     attempts.push({
       step: "worker-play",
       ok: false,
       status,
       ms,
-      reason: "empty url/proxy",
+      // Worker 声明了时长却没给地址：一般是刚更新、还没转码出播放地址。
+      ...(declared > 0
+        ? {
+            kind: "media_pending",
+            reason: "Worker 声明了时长但没有播放地址（可能刚更新）",
+            declaredDuration: declared,
+          }
+        : { reason: "empty url/proxy" }),
       ...(data && typeof data === "object"
         ? { keys: Object.keys(data).slice(0, 8) }
         : {}),
@@ -1546,12 +1570,21 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
       });
       return { url: siteUrl || deepSite, attempts };
     }
+    const detailData = (data && data.data) || null;
+    const duration = Number((detailData && detailData.duration) || 0);
     attempts.push({
       step: "site-play",
       ok: false,
       status,
       ms,
-      reason: "empty video_url",
+      // 有 duration、没有 video_url：上游更新了剧集但片源还没生成好。
+      ...(duration > 0
+        ? {
+            kind: "media_pending",
+            reason: "上游返回了时长但没有播放地址（可能刚更新）",
+            duration,
+          }
+        : { reason: "empty video_url" }),
       ...(data && typeof data === "object"
         ? { keys: Object.keys(data).slice(0, 8) }
         : {}),
@@ -2981,10 +3014,13 @@ async function resolveCandidatePlay(candidate, ctx) {
 }
 
 async function handlePlay(url, pool, env) {
-  const id = String(url.searchParams.get("id") || "").trim();
+  const id = stripNamespace(pool, String(url.searchParams.get("id") || "").trim());
   const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
   const slug = String(url.searchParams.get("up") || "").trim();
-  const pageHint = String(url.searchParams.get("page") || "").trim();
+  const pageHint = stripNamespace(
+    pool,
+    String(url.searchParams.get("page") || "").trim()
+  );
   const title = String(url.searchParams.get("title") || "").trim();
 
   if (!id) return jsonResponse({ code: 0, msg: "缺少 id", list: [] }, 400);
@@ -3097,15 +3133,20 @@ async function handlePlay(url, pool, env) {
     if (kind === "http" && Number(item.status) === 404) return false;
     return true;
   });
+  const pending = attempts.find(
+    (item) => item.ok === false && item.kind === "media_pending"
+  );
   const tried = candidates.map((item) => item.slug);
 
   return jsonResponse(
     {
       code: 0,
-      msg: systemic
-        ? errorMessage(lastError)
-        : `上游没有返回可播放地址（已尝试 ${tried.length} 个上游）`,
-      kind: systemic ? systemic.kind : "no_playable",
+      msg: pending
+        ? `该剧刚更新，上游还没生成播放地址，过几小时再试（已尝试 ${tried.length} 个上游）`
+        : systemic
+          ? errorMessage(lastError)
+          : `上游没有返回可播放地址（已尝试 ${tried.length} 个上游）`,
+      kind: pending ? "media_pending" : systemic ? systemic.kind : "no_playable",
       upstream: upstream.slug,
       tried,
       attempts,
@@ -3113,6 +3154,123 @@ async function handlePlay(url, pool, env) {
     },
     502
   );
+}
+
+/**
+ * 批量自检：给一批 id（或用分类拉最近 N 部），逐个问站点接口"这集有没有片源"。
+ * 用来快速判断"到底哪些剧能播、哪些没源"，比一部部点快得多。
+ *
+ *   /huangguo/api.php/provide/vod/?ac=playcheck&t=ai-duanju&limit=10
+ *   /huangguo/api.php/provide/vod/?ac=playcheck&ids=12612,7628&ep=2
+ */
+async function handlePlayCheck(url, pool, env) {
+  const slug = String(url.searchParams.get("up") || "").trim();
+  const upstream = upstreamBySlug(pool, slug);
+  if (!upstream || upstream.kind !== "huangguo") {
+    return jsonResponse(
+      { code: 0, msg: "只支持黄果原生上游（up=huangguo-web）" },
+      400
+    );
+  }
+  const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
+  const idsParam = String(url.searchParams.get("ids") || "").trim();
+
+  let items = [];
+  if (idsParam) {
+    items = idsParam
+      .split(",")
+      .map((value) => stripNamespace(pool, value.trim()))
+      .filter(Boolean)
+      .slice(0, 30)
+      .map((id) => ({ id, name: "" }));
+  } else {
+    const typeId = String(url.searchParams.get("t") || "ai-duanju").trim();
+    const limit = clamp(Number(url.searchParams.get("limit")) || 10, 1, 20);
+    const listUrl = typeId.startsWith("rank:")
+      ? `${upstream.api}/api/ranks/${encodeURIComponent(
+          typeId.slice("rank:".length)
+        )}?page=1&size=${limit}`
+      : `${upstream.api}/api/category/${encodeURIComponent(
+          typeId
+        )}?page=1&size=${limit}&sort=latest`;
+    try {
+      const { data } = await requestUpstreamJson(upstream, listUrl, env, {
+        timeoutMs: 8000,
+      });
+      items = (Array.isArray(data.list) ? data.list : [])
+        .slice(0, limit)
+        .map((item) => ({
+          id: String(item.vod_id != null ? item.vod_id : item.id || ""),
+          name: String(item.vod_name || item.name || ""),
+        }));
+    } catch (error) {
+      return jsonResponse(
+        { code: 0, msg: "拉取列表失败", detail: playAttemptError(error) },
+        502
+      );
+    }
+  }
+
+  const rows = await mapLimit(items, 3, async (item) => {
+    if (!item.id) return { ...item, ok: false, reason: "缺少 id" };
+    const target = `${upstream.site}/api/videos/${encodeURIComponent(
+      item.id
+    )}/play?ep=${encodeURIComponent(ep)}`;
+    const started = Date.now();
+    try {
+      const response = await fetchWithTimeout(
+        target,
+        {
+          headers: {
+            "User-Agent": UA,
+            Referer: `${upstream.site}/video/${encodeURIComponent(item.id)}/`,
+            Accept: "application/json, text/plain, */*",
+          },
+        },
+        7000
+      );
+      const text = await response.text();
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+      const data = (parsed && parsed.data) || {};
+      const hasVideo = !!(data.video_url || data.video_url_hevc);
+      return {
+        id: item.id,
+        name: item.name,
+        status: response.status,
+        ms: Date.now() - started,
+        msg: (parsed && parsed.msg) || "",
+        duration: data.duration == null ? null : Number(data.duration),
+        hasVideoUrl: !!data.video_url,
+        hasHevc: !!data.video_url_hevc,
+        mediaId: data.media_id || "",
+        ok: hasVideo,
+        ...(hasVideo ? {} : { reason: "没有 video_url" }),
+      };
+    } catch (error) {
+      return {
+        id: item.id,
+        name: item.name,
+        ms: Date.now() - started,
+        ok: false,
+        error: String((error && error.message) || error).slice(0, 140),
+      };
+    }
+  });
+
+  const okCount = rows.filter((row) => row.ok).length;
+  return jsonResponse({
+    code: 1,
+    msg: `可播 ${okCount}/${rows.length}`,
+    upstream: upstream.slug,
+    site: upstream.site,
+    ep,
+    rows,
+  });
 }
 
 /**
@@ -3137,7 +3295,7 @@ const BROWSER_HEADERS = {
 };
 
 async function handlePlayProbe(url, pool, env) {
-  const id = String(url.searchParams.get("id") || "").trim();
+  const id = stripNamespace(pool, String(url.searchParams.get("id") || "").trim());
   const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
   const slug = String(url.searchParams.get("up") || "").trim();
   const title = String(url.searchParams.get("title") || "").trim();
@@ -3295,10 +3453,13 @@ async function handlePlayProbe(url, pool, env) {
  *   &page=https%3A%2F%2Fhuangguoai.com%2Fvideo%2F12527%2Fep-1%2F&title=剧名
  */
 async function handlePlayDebug(url, pool, env) {
-  const id = String(url.searchParams.get("id") || "").trim();
+  const id = stripNamespace(pool, String(url.searchParams.get("id") || "").trim());
   const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
   const slug = String(url.searchParams.get("up") || "").trim();
-  const pageHint = String(url.searchParams.get("page") || "").trim();
+  const pageHint = stripNamespace(
+    pool,
+    String(url.searchParams.get("page") || "").trim()
+  );
   const title = String(url.searchParams.get("title") || "").trim();
 
   const upstream = upstreamBySlug(pool, slug);
@@ -3472,6 +3633,10 @@ export async function onRequest(context) {
 
   if (ac === "playprobe") {
     return handlePlayProbe(url, pool, env);
+  }
+
+  if (ac === "playcheck") {
+    return handlePlayCheck(url, pool, env);
   }
 
   if (isPlay) {
