@@ -20,10 +20,60 @@ interface Episode {
   url: string;
 }
 
+interface UpstreamErrorInfo {
+  upstream?: string;
+  name?: string;
+  kind?: string;
+  status?: number | null;
+  ms?: number | null;
+  message?: string;
+}
+
 interface DetailApiResponse {
   code: number;
   msg: string;
   list: Movie[];
+  error?: UpstreamErrorInfo;
+  errors?: UpstreamErrorInfo[];
+}
+
+function describeApiError(data: DetailApiResponse): string {
+  const error = data?.error;
+  const base = data?.msg || error?.message || "无法获取视频详情";
+  if (!error) return base;
+
+  const details: string[] = [];
+  if (error.upstream) details.push(`上游 ${error.upstream}`);
+  if (error.kind) details.push(error.kind);
+  if (error.status != null) details.push(`HTTP ${error.status}`);
+  if (error.ms != null) details.push(`${error.ms}ms`);
+  return details.length ? `${base}（${details.join(" · ")}）` : base;
+}
+
+/**
+ * 适配层对上游故障也返回 HTTP 200 + code:0，但代理/网关层仍可能返回非 2xx。
+ * 这里把响应体里的 msg / error 读出来，避免只剩 `HTTP error! status: xxx`。
+ */
+async function readResponseError(response: Response): Promise<string> {
+  try {
+    const text = await response.text();
+    if (!text) return "";
+    try {
+      const body = JSON.parse(text) as {
+        msg?: string;
+        error?: UpstreamErrorInfo | string;
+      };
+      if (body?.msg) return String(body.msg);
+      if (typeof body?.error === "string") return body.error;
+      if (body?.error?.message) return String(body.error.message);
+      if (body?.error?.kind) return String(body.error.kind);
+    } catch {
+      return text.slice(0, 200);
+    }
+  } catch {
+    // 响应体不可读时退回状态码。
+  }
+  return "";
 }
 
 interface PlayHistoryItem {
@@ -128,12 +178,19 @@ function PlayerPage() {
         // 使用 ac=detail 获取详情
         const targetUrl = `${apiBase}/api.php/provide/vod/?ac=detail&ids=${vodId}`;
         const response = await fetchWithProxy(targetUrl);
-        if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+        if (!response.ok) {
+          const detail = await readResponseError(response);
+          throw new Error(
+            detail
+              ? `HTTP ${response.status}: ${detail}`
+              : `HTTP error! status: ${response.status}`
+          );
+        }
         const data: DetailApiResponse = await response.json();
         if (data.code === 1 && data.list && data.list.length > 0) {
           setMovieDetails(data.list[0]);
         } else {
-          throw new Error(data.msg || "无法获取视频详情");
+          throw new Error(describeApiError(data));
         }
       } catch (e) {
         console.error("Failed to fetch movie details:", e);
@@ -453,7 +510,7 @@ function PlayerPage() {
         customType: {
           m3u8: function playM3u8(video, url, art) {
             if (Hls.isSupported()) {
-              if (art.hls) art.hls.destroy();
+              if (art.hls) (art.hls as Hls).destroy();
               const hls = new Hls();
               const proxyUrl = localStorage.getItem("m3u8ProxySelected");
               const finalUrl = proxyUrl ? `${proxyUrl}${url}` : url;

@@ -52,7 +52,7 @@ function SimplePlayerPage() {
         customType: {
           m3u8: function playM3u8(video, url, art) {
             if (Hls.isSupported()) {
-              if (art.hls) art.hls.destroy();
+              if (art.hls) (art.hls as Hls).destroy();
               const hls = new Hls();
               const proxyUrl = localStorage.getItem("m3u8ProxySelected");
               const finalUrl = proxyUrl ? `${proxyUrl}${url}` : url;

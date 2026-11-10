@@ -1,19 +1,39 @@
 /**
- * 黄果短剧 Pages Function 适配层。
+ * 黄果短剧 Pages Function 适配层（多上游版）。
  *
- * MorphoTV 只会请求 MacCMS 风格的：
+ * 对外仍然只暴露 MacCMS 形态：
+ *   /huangguo/api.php/provide/vod/?ac=list
  *   /huangguo/api.php/provide/vod/?ac=videolist&wd=...
  *   /huangguo/api.php/provide/vod/?ac=detail&ids=...
- * 这里把请求翻译成上游 QuickJS 源使用的 Worker JSON 接口。
+ *   /huangguo/api.php/provide/vod/?ac=upstreams       (诊断)
+ *   /huangguo/media?src=...                            (图片代理)
  *
- * Worker 地址从上游最新 tag 的 huangguo_web_spider.js 里提取，
- * 所以上游发新版本后这里会跟着更新。
+ * 上游池由三部分组成：
+ *   1. 黄果 spider 里的 API / SITE（原生 Worker JSON 接口）；
+ *   2. all_sources_config.json 里 type=1 的 MacCMS 站（api.php/provide/vod、
+ *      api/json.php 等标准 MacCMS 查询参数）；
+ *   3. 环境变量 HUANGGUO_UPSTREAMS（设置后完全覆盖前两项）。
+ *
+ * 跨站 id 采用 `slug~id` 命名空间；不带 `~` 的 id 仍路由到默认黄果上游，
+ * 因此旧链接 /ac=detail&ids=12527 不受影响。
+ *
+ * 上游故障（超时 / 522 / 非 JSON / 熔断）返回 HTTP 200 + code:0 + 具体 msg，
+ * 并附带 error:{upstream,kind,status,ms}，前端才能把原因显示出来。
+ *
+ * HUANGGUO_UPSTREAMS（覆盖整个候选池）支持：
+ *   JSON: [{"key":"huangguo_web","name":"黄果短剧","kind":"huangguo",
+ *           "api":"https://...workers.dev","site":"https://huangguoai.com"},
+ *          {"key":"ob25","name":"360资源","api":"https://360zy.com/api.php/provide/vod/"}]
+ *   文本: key|name|api  或  key=api  或  直接写 https://.../api.php/provide/vod/
+ *         原生黄果用 key|name|api|site|huangguo 五段式。
  */
 
 const DEFAULT_API = "https://huangguo-parser.13681235735.workers.dev";
 const DEFAULT_SITE = "https://huangguoai.com";
 const SPIDER_JS_URL =
   "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/huangguo_web_spider.js";
+const SOURCES_JSON_URL =
+  "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/all_sources_config.json";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -25,42 +45,277 @@ const CORS = {
   "Access-Control-Max-Age": "86400",
 };
 
-let configCache = { api: DEFAULT_API, site: DEFAULT_SITE, expires: 0, loading: null };
+const HOUR = 60 * 60 * 1000;
+const DEFAULT_TTL_MS = 5 * HOUR; // 4~6 小时之间
+const DEFAULT_TIMEOUT_MS = 12000;
+const DEFAULT_BREAKER_THRESHOLD = 3;
+const DEFAULT_COOLDOWN_MS = 60 * 1000;
+const DEFAULT_SEARCH_CONCURRENCY = 8;
+const DEFAULT_SEARCH_TIMEOUT_MS = 5000;
+const DEFAULT_SEARCH_DEADLINE_MS = 9000;
+const DEFAULT_PROBE_TIMEOUT_MS = 4000;
+const DEFAULT_PROBE_DEADLINE_MS = 9000;
 
-function refreshConfig() {
-  if (configCache.loading) return configCache.loading;
+const POOL_CACHE_URL = "https://huangguo.internal/__upstreams_v1";
+const BOOTSTRAP_TTL_MS = 30 * 1000;
 
-  configCache.loading = (async () => {
-    try {
-      const response = await fetch(SPIDER_JS_URL, {
-        cache: "no-store",
-        signal: AbortSignal.timeout(6000),
-      });
-      if (response.ok) {
-        const text = await response.text();
-        const api = text.match(/(?:const|let|var)\s+API\s*=\s*['"]([^'"]+)['"]/)?.[1];
-        const site = text.match(/(?:const|let|var)\s+SITE\s*=\s*['"]([^'"]+)['"]/)?.[1];
-        if (api) configCache.api = api;
-        if (site) configCache.site = site;
-        configCache.expires = Date.now() + 60 * 60 * 1000;
-      }
-    } catch (error) {
-      console.warn("读取上游 spider 配置失败，使用内置地址:", error);
-    } finally {
-      configCache.loading = null;
-    }
-  })();
+const HUANGGUO_CLASSES = [
+  { type_id: "ai-duanju", type_name: "AI短剧" },
+  { type_id: "ai-manju", type_name: "AI漫剧" },
+  { type_id: "ai-huanlian", type_name: "换脸专区" },
+  { type_id: "ai-mogai", type_name: "魔改专区" },
+  { type_id: "chigua", type_name: "吃瓜·全部" },
+  { type_id: "rank:hot", type_name: "热播榜" },
+  { type_id: "rank:recommend", type_name: "推荐榜" },
+  { type_id: "rank:potential", type_name: "潜力榜" },
+];
 
-  return configCache.loading;
+// { pool, expiresAt, loading }：单个 isolate 内的热缓存。
+const poolState = { pool: null, expiresAt: 0, loading: null };
+
+// 上游健康状态 / 熔断器。只存在当前 isolate，跨 isolate 由请求重新学习。
+const healthState = new Map();
+
+/* -------------------------------------------------------------------------- */
+/* 基础工具                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...CORS,
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
 }
 
-async function getConfig() {
-  // 不阻塞当前请求：先用内置地址，后台刷新上游最新 Worker 地址
-  if (Date.now() >= configCache.expires && !configCache.loading) {
-    refreshConfig().catch(() => {});
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function envNumber(env, key, fallback) {
+  const raw = Number(env && env[key]);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+function poolTtl(env) {
+  return clamp(envNumber(env, "HUANGGUO_POOL_TTL_MS", DEFAULT_TTL_MS), 4 * HOUR, 6 * HOUR);
+}
+
+function upstreamTimeout(env) {
+  return clamp(envNumber(env, "HUANGGUO_TIMEOUT_MS", DEFAULT_TIMEOUT_MS), 3000, 25000);
+}
+
+function breakerThreshold(env) {
+  return clamp(envNumber(env, "HUANGGUO_BREAKER_THRESHOLD", DEFAULT_BREAKER_THRESHOLD), 1, 10);
+}
+
+function breakerCooldown(env) {
+  return clamp(envNumber(env, "HUANGGUO_BREAKER_COOLDOWN_MS", DEFAULT_COOLDOWN_MS), 15000, 600000);
+}
+
+function searchConcurrency(env) {
+  return clamp(envNumber(env, "HUANGGUO_SEARCH_CONCURRENCY", DEFAULT_SEARCH_CONCURRENCY), 1, 16);
+}
+
+function searchTimeout(env) {
+  return clamp(
+    envNumber(env, "HUANGGUO_SEARCH_TIMEOUT_MS", DEFAULT_SEARCH_TIMEOUT_MS),
+    2000,
+    8000
+  );
+}
+
+function searchDeadlineMs(env) {
+  return clamp(
+    envNumber(env, "HUANGGUO_SEARCH_DEADLINE_MS", DEFAULT_SEARCH_DEADLINE_MS),
+    3000,
+    15000
+  );
+}
+
+function slugify(value) {
+  const slug = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return slug || "upstream";
+}
+
+function uniqueSlug(base, used) {
+  let slug = base;
+  let suffix = 2;
+  while (used.has(slug)) {
+    slug = `${base}-${suffix++}`;
   }
-  return configCache;
+  used.add(slug);
+  return slug;
 }
+
+function namespaceId(upstream, id) {
+  const raw = String(id == null ? "" : id);
+  if (!raw) return "";
+  const prefix = `${upstream.slug}~`;
+  return raw.startsWith(prefix) ? raw : `${prefix}${raw}`;
+}
+
+function normalizeBase(value) {
+  return String(value || "").trim().replace(/\/+$/, "");
+}
+
+function normalizeMaccmsEndpoint(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return "";
+  }
+  if (!/^https?:$/.test(url.protocol)) return "";
+  if (!url.pathname || url.pathname === "/") {
+    url.pathname = "/api.php/provide/vod/";
+  }
+  url.hash = "";
+  let out = url.toString().replace(/\/+$/, "");
+  if (out.endsWith("?")) out = out.slice(0, -1);
+  return out;
+}
+
+function originOf(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return "";
+  }
+}
+
+function hostOf(value) {
+  try {
+    return new URL(value).host;
+  } catch {
+    return "";
+  }
+}
+
+function isoTime(ms) {
+  if (!ms) return null;
+  try {
+    return new Date(ms).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 错误                                                                        */
+/* -------------------------------------------------------------------------- */
+
+class UpstreamError extends Error {
+  constructor(upstream, kind, message, options = {}) {
+    super(message || kind || "upstream error");
+    this.name = "UpstreamError";
+    this.upstream = upstream && upstream.slug ? upstream.slug : String(upstream || "");
+    this.upstreamName =
+      (upstream && upstream.name) || this.upstream || "上游";
+    this.kind = kind || "upstream";
+    this.status =
+      options.status === null || options.status === undefined || options.status === ""
+        ? null
+        : Number.isFinite(Number(options.status))
+          ? Number(options.status)
+          : null;
+    this.ms = Math.max(0, Math.round(Number(options.ms) || 0));
+    // 聚合错误需要覆盖默认的“上游 X 超时”文案。
+    this.summary = options.summary || "";
+    if (options.cause) this.cause = options.cause;
+  }
+
+  toJSON() {
+    return {
+      upstream: this.upstream,
+      name: this.upstreamName,
+      kind: this.kind,
+      status: this.status,
+      ms: this.ms,
+      message: this.message,
+    };
+  }
+}
+
+function kindLabel(kind) {
+  const labels = {
+    timeout: "超时",
+    http: "HTTP错误",
+    parse: "解析失败",
+    network: "网络错误",
+    circuit_open: "熔断冷却",
+    upstream: "上游错误",
+    no_playable: "无播放地址",
+    unknown_upstream: "未知上游",
+    search: "搜索失败",
+  };
+  return labels[kind] || kind || "未知错误";
+}
+
+function errorMessage(error) {
+  if (error.summary) return error.summary;
+  const name = error.upstreamName || error.upstream || "上游";
+  switch (error.kind) {
+    case "timeout":
+      return `上游「${name}」请求超时（${error.ms}ms）`;
+    case "http":
+      return `上游「${name}」返回 HTTP ${error.status}${error.ms ? `（${error.ms}ms）` : ""}`;
+    case "parse":
+      return `上游「${name}」响应解析失败（不是有效 JSON）`;
+    case "network":
+      return `上游「${name}」网络连接失败${error.ms ? `（${error.ms}ms）` : ""}`;
+    case "circuit_open":
+      return `上游「${name}」处于失败冷却中，请稍后再试`;
+    case "no_playable":
+      return `上游「${name}」返回了详情，但没有解析到可播放地址`;
+    case "unknown_upstream":
+      return error.message || "未知的上游";
+    case "upstream":
+    case "search":
+      return `上游「${name}」返回错误：${error.message}`;
+    default:
+      return `上游「${name}」请求失败：${error.message}`;
+  }
+}
+
+function errorResponse(error, extra = {}) {
+  return jsonResponse({
+    code: 0,
+    msg: errorMessage(error),
+    page: 1,
+    pagecount: 0,
+    limit: 0,
+    total: 0,
+    list: [],
+    error: error.toJSON(),
+    ...extra,
+  });
+}
+
+function summarizeKinds(errors) {
+  const counts = new Map();
+  for (const error of errors) {
+    const kind = error && error.kind ? error.kind : "upstream";
+    counts.set(kind, (counts.get(kind) || 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .map(([kind, count]) => `${kindLabel(kind)} ${count}`)
+    .join("、");
+}
+
+/* -------------------------------------------------------------------------- */
+/* 鉴权（保持原有行为）                                                        */
+/* -------------------------------------------------------------------------- */
 
 function getEmail(request) {
   const header = request.headers.get("Cf-Access-Authenticated-User-Email");
@@ -112,49 +367,661 @@ async function checkAccess(request, env) {
   return { ok: true };
 }
 
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...CORS, "Content-Type": "application/json; charset=utf-8" },
+/* -------------------------------------------------------------------------- */
+/* 上游池                                                                      */
+/* -------------------------------------------------------------------------- */
+
+function nativeUpstream(api, site, source = "spider") {
+  const key = "huangguo_web";
+  return {
+    key,
+    slug: slugify(key),
+    name: "黄果短剧",
+    kind: "huangguo",
+    source,
+    api: normalizeBase(api || DEFAULT_API),
+    site: normalizeBase(site || DEFAULT_SITE),
+  };
+}
+
+function maccmsUpstream(site, source = "config") {
+  const endpoint = normalizeMaccmsEndpoint(site && site.api);
+  if (!endpoint) return null;
+  const key = String((site && site.key) || hostOf(endpoint) || "maccms");
+  return {
+    key,
+    slug: slugify(key),
+    name: String((site && site.name) || key),
+    kind: "maccms",
+    source,
+    endpoint,
+    site: originOf(endpoint),
+    searchable: site && Number(site.searchable) === 0 ? false : true,
+  };
+}
+
+function bootstrapPool() {
+  return hydratePool({
+    source: "bootstrap",
+    updatedAt: 0,
+    upstreams: [nativeUpstream(DEFAULT_API, DEFAULT_SITE, "builtin")],
+    expiresAt: Date.now() + BOOTSTRAP_TTL_MS,
   });
 }
 
-async function fetchJson(url, referer, timeout = 15000) {
-  const response = await fetch(url, {
-    headers: { "User-Agent": UA, "Referer": referer },
-    signal: AbortSignal.timeout(timeout),
-  });
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
-}
-
-function picOf(config, value) {
-  const raw = String(value || "");
-  if (!raw) return "";
-  if (/^https?:\/\//i.test(raw)) {
-    return `${config.api}/media?url=${encodeURIComponent(raw)}`;
-  }
-  return `${config.api}${raw}`;
-}
-
-function toVod(item, config, wrapPic = false, origin = "") {
-  let pic = wrapPic
-    ? picOf(config, item.vod_pic || item.cover)
-    : String(item.vod_pic || item.cover || "");
-
-  // Worker 的列表接口有时返回 /media?url=... 这种相对路径，
-  // 先补成 Worker 绝对地址，再统一走本站图片代理。
-  if (pic && !/^https?:\/\//i.test(pic)) {
-    pic = `${config.api}${pic.startsWith("/") ? "" : "/"}${pic}`;
-  }
-  if (pic && origin) {
-    pic = `${origin}/huangguo/media?src=${encodeURIComponent(pic)}`;
+function hydratePool(raw) {
+  const list = Array.isArray(raw && raw.upstreams) ? raw.upstreams : [];
+  const used = new Set();
+  const upstreams = [];
+  for (const item of list) {
+    if (!item || !item.slug || !item.kind) continue;
+    const slug = uniqueSlug(slugify(item.slug), used);
+    if (item.kind === "huangguo") {
+      if (!item.api || !item.site) continue;
+      upstreams.push({
+        key: String(item.key || slug),
+        slug,
+        name: String(item.name || "黄果短剧"),
+        kind: "huangguo",
+        source: String(item.source || "cache"),
+        api: normalizeBase(item.api),
+        site: normalizeBase(item.site),
+        searchable: item.searchable !== false,
+      });
+    } else {
+      if (!item.endpoint) continue;
+      const endpoint = normalizeMaccmsEndpoint(item.endpoint);
+      if (!endpoint) continue;
+      upstreams.push({
+        key: String(item.key || slug),
+        slug,
+        name: String(item.name || item.key || slug),
+        kind: "maccms",
+        source: String(item.source || "cache"),
+        endpoint,
+        site: String(item.site || originOf(endpoint)),
+        searchable: item.searchable !== false,
+      });
+    }
   }
 
   return {
+    source: String((raw && raw.source) || "cache"),
+    updatedAt: Number((raw && raw.updatedAt) || 0),
+    expiresAt: Number((raw && raw.expiresAt) || 0),
+    upstreams,
+    bySlug: new Map(upstreams.map((item) => [item.slug, item])),
+  };
+}
+
+function parseSpiderConfig(text) {
+  const api = String(text || "").match(
+    /(?:const|let|var)\s+API\s*=\s*['"]([^'"]+)['"]/
+  )?.[1];
+  const site = String(text || "").match(
+    /(?:const|let|var)\s+SITE\s*=\s*['"]([^'"]+)['"]/
+  )?.[1];
+  return {
+    api: normalizeBase(api || DEFAULT_API),
+    site: normalizeBase(site || DEFAULT_SITE),
+  };
+}
+
+function parseConfigUpstreams(text) {
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const sites = Array.isArray(data && data.sites) ? data.sites : [];
+  const out = [];
+  for (const site of sites) {
+    if (!site || Number(site.type) !== 1) continue;
+    const upstream = maccmsUpstream(site, "config");
+    if (upstream) out.push(upstream);
+  }
+  return out;
+}
+
+function envOverrideText(env) {
+  return String((env && env.HUANGGUO_UPSTREAMS) || "").trim();
+}
+
+function buildUpstreamFromEnvItem(item, index) {
+  if (typeof item === "string") {
+    const raw = item.trim();
+    if (!raw) return null;
+
+    const parts = raw.split("|").map((part) => part.trim());
+    if (parts.length >= 3) {
+      const kind = parts[4] === "huangguo" ? "huangguo" : "maccms";
+      if (kind === "huangguo") {
+        const native = nativeUpstream(parts[2], parts[3] || originOf(parts[2]), "env");
+        native.key = parts[0] || native.key;
+        native.slug = slugify(parts[0] || native.key);
+        native.name = parts[1] || native.name;
+        return native;
+      }
+      return maccmsUpstream({ key: parts[0], name: parts[1], api: parts[2] }, "env");
+    }
+
+    const eq = raw.indexOf("=");
+    if (eq > 0 && eq < raw.indexOf("://")) {
+      return maccmsUpstream(
+        { key: raw.slice(0, eq).trim(), name: raw.slice(0, eq).trim(), api: raw.slice(eq + 1).trim() },
+        "env"
+      );
+    }
+
+    if (raw.includes("://")) {
+      return maccmsUpstream(
+        { key: `${hostOf(raw) || `env-${index + 1}`}`, name: hostOf(raw) || raw, api: raw },
+        "env"
+      );
+    }
+    return null;
+  }
+
+  if (!item || typeof item !== "object") return null;
+  const kind = item.kind === "huangguo" ? "huangguo" : "maccms";
+  if (kind === "huangguo") {
+    const native = nativeUpstream(
+      item.api,
+      item.site || originOf(item.api),
+      "env"
+    );
+    native.key = String(item.key || native.key);
+    native.slug = slugify(item.key || native.key);
+    native.name = String(item.name || native.name);
+    return native;
+  }
+  return maccmsUpstream(
+    {
+      key: item.key,
+      name: item.name,
+      api: item.api || item.endpoint,
+      searchable: item.searchable,
+    },
+    "env"
+  );
+}
+
+function poolFromEnv(env) {
+  const raw = envOverrideText(env);
+  if (!raw) return null;
+
+  let items = [];
+  try {
+    if (raw.startsWith("[") || raw.startsWith("{")) {
+      const parsed = JSON.parse(raw);
+      items = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed && parsed.upstreams)
+          ? parsed.upstreams
+          : [];
+    }
+  } catch {
+    return null;
+  }
+
+  if (!items.length) {
+    items = raw
+      .split(/[\n;,]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  const upstreams = [];
+  items.forEach((item, index) => {
+    const upstream = buildUpstreamFromEnvItem(item, index);
+    if (upstream) upstreams.push(upstream);
+  });
+  if (!upstreams.length) return null;
+
+  return hydratePool({
+    source: "env",
+    updatedAt: Date.now(),
+    expiresAt: Date.now() + poolTtl(env),
+    upstreams,
+  });
+}
+
+async function cacheGetPool() {
+  if (typeof caches === "undefined" || !caches.default) return null;
+  try {
+    const response = await caches.default.match(POOL_CACHE_URL);
+    if (!response) return null;
+    const data = await response.json();
+    if (!data || !Array.isArray(data.upstreams) || !data.upstreams.length) return null;
+    return hydratePool(data);
+  } catch {
+    return null;
+  }
+}
+
+async function cachePutPool(pool) {
+  if (typeof caches === "undefined" || !caches.default) return;
+  try {
+    const ttlMs = Math.max(60000, pool.expiresAt - Date.now());
+    const body = JSON.stringify({
+      version: 1,
+      source: pool.source,
+      updatedAt: pool.updatedAt,
+      expiresAt: pool.expiresAt,
+      upstreams: pool.upstreams.map((item) => ({
+        key: item.key,
+        slug: item.slug,
+        name: item.name,
+        kind: item.kind,
+        source: item.source,
+        api: item.api,
+        site: item.site,
+        endpoint: item.endpoint,
+        searchable: item.searchable,
+      })),
+    });
+    await caches.default.put(
+      POOL_CACHE_URL,
+      new Response(body, {
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": `public, max-age=${Math.floor(ttlMs / 1000)}`,
+        },
+      })
+    );
+  } catch {
+    // Cache API 不可用时继续用内存池。
+  }
+}
+
+async function fetchText(url, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "application/json, text/plain, */*",
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.text();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refreshPool(env) {
+  if (poolState.loading) return poolState.loading;
+
+  poolState.loading = (async () => {
+    const previous = poolState.pool || (await cacheGetPool());
+    const [spiderResult, sourcesResult] = await Promise.allSettled([
+      fetchText(SPIDER_JS_URL, 8000),
+      fetchText(SOURCES_JSON_URL, 10000),
+    ]);
+
+    let native = nativeUpstream(DEFAULT_API, DEFAULT_SITE, "builtin");
+    if (spiderResult.status === "fulfilled") {
+      const parsedSpider = parseSpiderConfig(spiderResult.value);
+      native = nativeUpstream(parsedSpider.api, parsedSpider.site, "spider");
+    } else {
+      console.warn("读取黄果 spider 配置失败，沿用内置地址");
+    }
+
+    let configUpstreams = [];
+    const parsedConfig =
+      sourcesResult.status === "fulfilled"
+        ? parseConfigUpstreams(sourcesResult.value)
+        : null;
+
+    if (parsedConfig) {
+      configUpstreams = parsedConfig;
+    } else {
+      // 配置源临时失败/返回坏 JSON 时保留上一次的 MacCMS 上游，避免池子瞬间缩水。
+      const stale = previous && previous.upstreams ? previous.upstreams : [];
+      configUpstreams = stale
+        .filter((item) => item.kind === "maccms")
+        .map((item) => ({ ...item, source: item.source || "cache" }));
+      console.warn("读取 all_sources_config.json 失败，沿用缓存中的 MacCMS 上游");
+    }
+
+    const pool = hydratePool({
+      source: "auto",
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + poolTtl(env),
+      upstreams: [native, ...configUpstreams],
+    });
+
+    // 保证至少有一个可用上游。
+    if (!pool.upstreams.length) {
+      pool.upstreams = [native];
+      pool.bySlug = new Map([[native.slug, native]]);
+    }
+
+    poolState.pool = pool;
+    poolState.expiresAt = pool.expiresAt;
+    await cachePutPool(pool);
+    return pool;
+  })()
+    .catch((error) => {
+      console.warn("刷新上游池失败:", error && error.message);
+      return null;
+    })
+    .finally(() => {
+      poolState.loading = null;
+    });
+
+  return poolState.loading;
+}
+
+function scheduleRefresh(env, context) {
+  const task = refreshPool(env);
+  if (context && typeof context.waitUntil === "function") {
+    context.waitUntil(task.catch(() => {}));
+  }
+  return task;
+}
+
+async function getPool(env, context, options = {}) {
+  const envPool = poolFromEnv(env);
+  if (envPool) return envPool;
+
+  const now = Date.now();
+  const awaitRefresh = options.awaitRefresh === true;
+
+  if (poolState.pool) {
+    if (poolState.expiresAt > now) {
+      // 诊断端点遇到只有内置黄果的 bootstrap 池时，强制刷新一次，
+      // 否则第一次打开 ?ac=upstreams 可能只看到一个上游。
+      if (awaitRefresh && poolState.pool.source === "bootstrap") {
+        const fresh = await refreshPool(env);
+        if (fresh) return fresh;
+      }
+      return poolState.pool;
+    }
+    if (awaitRefresh) {
+      const fresh = await refreshPool(env);
+      if (fresh) return fresh;
+    } else {
+      scheduleRefresh(env, context);
+    }
+    return poolState.pool;
+  }
+
+  const cached = await cacheGetPool();
+  if (cached && cached.expiresAt > now) {
+    poolState.pool = cached;
+    poolState.expiresAt = cached.expiresAt;
+    return cached;
+  }
+
+  if (awaitRefresh) {
+    const fresh = await refreshPool(env);
+    if (fresh) return fresh;
+  } else {
+    scheduleRefresh(env, context);
+  }
+
+  if (cached && cached.upstreams.length) {
+    poolState.pool = cached;
+    poolState.expiresAt = Math.min(cached.expiresAt || 0, now + BOOTSTRAP_TTL_MS);
+    return cached;
+  }
+
+  const bootstrap = bootstrapPool();
+  poolState.pool = bootstrap;
+  poolState.expiresAt = bootstrap.expiresAt;
+  return bootstrap;
+}
+
+function defaultUpstream(pool) {
+  if (!pool || !pool.upstreams.length) return null;
+  const native = pool.upstreams.find((item) => item.kind === "huangguo");
+  return native || pool.upstreams[0];
+}
+
+function upstreamBySlug(pool, slug) {
+  if (!pool) return null;
+  if (!slug) return defaultUpstream(pool);
+  const direct = pool.bySlug.get(slug);
+  if (direct) return direct;
+  // 兼容可能出现的旧别名。
+  if (slug === "huangguo" || slug === "huangguo_web") {
+    return pool.upstreams.find((item) => item.kind === "huangguo") || null;
+  }
+  return null;
+}
+
+function requestedSlug(url) {
+  const querySlug =
+    url.searchParams.get("slug") ||
+    url.searchParams.get("upstream") ||
+    url.searchParams.get("source") ||
+    "";
+  if (querySlug.trim()) return querySlug.trim();
+
+  const segments = url.pathname.split("/").filter(Boolean);
+  const index = segments.lastIndexOf("huangguo");
+  if (index >= 0) {
+    const next = segments[index + 1];
+    if (next && next !== "api.php" && next !== "api" && next !== "media") {
+      return decodeURIComponent(next);
+    }
+  }
+  return "";
+}
+
+/* -------------------------------------------------------------------------- */
+/* 健康检查 / 熔断                                                             */
+/* -------------------------------------------------------------------------- */
+
+function healthOf(upstream) {
+  let state = healthState.get(upstream.slug);
+  if (!state) {
+    state = {
+      failures: 0,
+      successes: 0,
+      consecutiveFailures: 0,
+      circuitOpenUntil: 0,
+      latencyMs: null,
+      lastCheckedAt: 0,
+      lastSuccessAt: 0,
+      lastError: null,
+    };
+    healthState.set(upstream.slug, state);
+  }
+  return state;
+}
+
+function isCircuitOpen(upstream) {
+  const state = healthState.get(upstream.slug);
+  return !!state && state.circuitOpenUntil > Date.now();
+}
+
+function markSuccess(upstream, ms) {
+  const state = healthOf(upstream);
+  state.successes += 1;
+  state.failures = 0;
+  state.consecutiveFailures = 0;
+  state.circuitOpenUntil = 0;
+  state.latencyMs = Math.round(ms);
+  state.lastCheckedAt = Date.now();
+  state.lastSuccessAt = Date.now();
+}
+
+function markFailure(upstream, error, env) {
+  const state = healthOf(upstream);
+  state.failures += 1;
+  state.consecutiveFailures += 1;
+  state.lastCheckedAt = Date.now();
+  state.latencyMs = error.ms || state.latencyMs;
+  state.lastError = error.toJSON();
+  if (state.consecutiveFailures >= breakerThreshold(env)) {
+    const extra = Math.min(state.consecutiveFailures - breakerThreshold(env), 4);
+    state.circuitOpenUntil = Date.now() + breakerCooldown(env) * (1 + extra);
+  }
+}
+
+function statusOf(upstream) {
+  const state = healthState.get(upstream.slug);
+  if (state && state.circuitOpenUntil > Date.now()) return "circuit_open";
+  if (state && state.consecutiveFailures > 0) return "degraded";
+  if (state && state.lastSuccessAt) return "ok";
+  return "unknown";
+}
+
+/* -------------------------------------------------------------------------- */
+/* 上游请求                                                                    */
+/* -------------------------------------------------------------------------- */
+
+async function fetchWithTimeout(url, init, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function refererOf(upstream) {
+  return `${(upstream && (upstream.site || originOf(upstream.api))) || DEFAULT_SITE}/`;
+}
+
+async function requestUpstreamJson(upstream, url, env, options = {}) {
+  const timeoutMs = clamp(
+    Number(options.timeoutMs) || upstreamTimeout(env),
+    1000,
+    30000
+  );
+
+  if (!options.bypassBreaker && isCircuitOpen(upstream)) {
+    const state = healthState.get(upstream.slug);
+    const remain = Math.max(0, (state.circuitOpenUntil || 0) - Date.now());
+    throw new UpstreamError(
+      upstream,
+      "circuit_open",
+      `失败冷却中，剩余 ${Math.ceil(remain / 1000)} 秒`,
+      { ms: 0 }
+    );
+  }
+
+  const start = Date.now();
+  let status = null;
+
+  try {
+    const response = await fetchWithTimeout(
+      url,
+      {
+        headers: {
+          "User-Agent": UA,
+          Referer: refererOf(upstream),
+          Accept: "application/json, text/plain, */*",
+        },
+      },
+      timeoutMs
+    );
+    status = response.status;
+    const text = await response.text();
+    const ms = Date.now() - start;
+
+    if (!response.ok) {
+      throw new UpstreamError(upstream, "http", `HTTP ${response.status}`, {
+        status,
+        ms,
+      });
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new UpstreamError(upstream, "parse", "响应不是有效 JSON", {
+        status,
+        ms,
+      });
+    }
+    if (!data || typeof data !== "object") {
+      throw new UpstreamError(upstream, "parse", "响应 JSON 不是对象", {
+        status,
+        ms,
+      });
+    }
+    if (Number(data.code) === 0) {
+      const message = String(data.msg || data.message || "上游返回 code=0").trim();
+      throw new UpstreamError(upstream, "upstream", message, { status, ms });
+    }
+
+    markSuccess(upstream, ms);
+    return { data, ms, status };
+  } catch (error) {
+    const ms = Date.now() - start;
+    let err = error;
+    if (!(err instanceof UpstreamError)) {
+      const name = String((error && error.name) || "");
+      const message = String((error && error.message) || "");
+      const timeout =
+        name === "AbortError" ||
+        name === "TimeoutError" ||
+        /abort|timed? ?out/i.test(message);
+      const kind = timeout ? "timeout" : "network";
+      err = new UpstreamError(
+        upstream,
+        kind,
+        timeout ? `请求超过 ${timeoutMs}ms` : message || "网络请求失败",
+        { status, ms }
+      );
+    } else if (!err.ms) {
+      err.ms = ms;
+    }
+    markFailure(upstream, err, env);
+    throw err;
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 数据归一化                                                                  */
+/* -------------------------------------------------------------------------- */
+
+function proxyPicture(origin, upstream, value) {
+  let pic = String(value || "").trim();
+  if (!pic) return "";
+  if (pic.startsWith("//")) pic = `https:${pic}`;
+  if (!/^https?:\/\//i.test(pic)) {
+    const base = upstream.site || originOf(upstream.api) || DEFAULT_SITE;
+    pic = `${base}${pic.startsWith("/") ? "" : "/"}${pic}`;
+  }
+  if (!origin) return pic;
+  return `${origin}/huangguo/media?src=${encodeURIComponent(pic)}&up=${encodeURIComponent(upstream.slug)}`;
+}
+
+function nativePicture(upstream, value, wrapPic) {
+  const raw = String(value || "");
+  if (!raw) return "";
+  if (raw.startsWith("//")) {
+    const absolute = `https:${raw}`;
+    return wrapPic ? `${upstream.api}/media?url=${encodeURIComponent(absolute)}` : absolute;
+  }
+  if (/^https?:\/\//i.test(raw)) {
+    return wrapPic ? `${upstream.api}/media?url=${encodeURIComponent(raw)}` : raw;
+  }
+  // Worker 列表偶尔返回 /media?url=... 这种相对路径，必须先补上 Worker 地址。
+  return `${upstream.api}${raw.startsWith("/") ? "" : "/"}${raw}`;
+}
+
+function toNativeVod(item, upstream, origin, wrapPic = false) {
+  const rawPic = nativePicture(
+    upstream,
+    item.vod_pic || item.cover || "",
+    wrapPic
+  );
+  return {
     vod_id: String(item.vod_id || item.id || ""),
     vod_name: String(item.vod_name || item.title || ""),
-    vod_pic: pic,
+    vod_pic: proxyPicture(origin, upstream, rawPic),
     vod_remarks: String(item.vod_remarks || ""),
     type_name: String(item.type_name || ""),
     vod_year: String(item.vod_year || ""),
@@ -163,49 +1030,25 @@ function toVod(item, config, wrapPic = false, origin = "") {
   };
 }
 
-async function search(keyword, config, origin) {
-  let list = [];
-
-  try {
-    const data = await fetchJson(
-      `${config.api}/api/search/${encodeURIComponent(keyword)}?page=1&size=50`,
-      `${config.site}/`
-    );
-    if (Array.isArray(data?.list)) {
-      list = data.list.map((item) => toVod(item, config, false, origin));
-    }
-  } catch (error) {
-    console.warn("Worker 搜索失败:", error);
-  }
-
-  if (!list.length) {
-    try {
-      const data = await fetchJson(
-        `${config.site}/api/search?q=${encodeURIComponent(keyword)}&page=1&size=50`,
-        `${config.site}/`
-      );
-      const items = data?.data?.items;
-      if (Array.isArray(items)) {
-        list = items.map((item) => toVod(item, config, true, origin));
-      }
-    } catch (error) {
-      console.warn("站点搜索兜底失败:", error);
-    }
-  }
-
-  return list.filter((item) => item.vod_id && item.vod_name);
+function toMaccmsVod(item, upstream, origin) {
+  return {
+    vod_id: String(item.vod_id != null ? item.vod_id : item.id != null ? item.id : ""),
+    vod_name: String(item.vod_name || item.name || item.title || ""),
+    vod_pic: proxyPicture(
+      origin,
+      upstream,
+      item.vod_pic || item.vod_pic_thumb || item.pic || ""
+    ),
+    vod_remarks: String(item.vod_remarks || item.vod_note || ""),
+    type_name: String(item.type_name || item.vod_class || ""),
+    vod_year: String(item.vod_year || ""),
+    vod_area: String(item.vod_area || ""),
+    vod_score: String(item.vod_score || ""),
+  };
 }
 
-async function resolvePlay(id, ep, config) {
-  try {
-    const data = await fetchJson(
-      `${config.api}/api/play?url=${encodeURIComponent(id)}&ep=${encodeURIComponent(ep)}`,
-      `${config.site}/`
-    );
-    return typeof data?.url === "string" ? data.url : "";
-  } catch {
-    return "";
-  }
+function isHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value || ""));
 }
 
 async function mapLimit(items, limit, mapper) {
@@ -221,107 +1064,778 @@ async function mapLimit(items, limit, mapper) {
   }
 
   await Promise.all(
-    Array.from({ length: Math.min(limit, items.length) }, () => worker())
+    Array.from({ length: Math.min(Math.max(1, limit), items.length || 1) }, () => worker())
   );
   return results;
 }
 
-async function buildDetail(id, config, origin) {
-  let item = null;
-  try {
-    const data = await fetchJson(
-      `${config.api}/api/detail/${encodeURIComponent(id)}`,
-      `${config.site}/`
-    );
-    item = data?.list?.[0] || null;
-  } catch (error) {
-    console.warn("Worker 详情失败:", error);
+/* -------------------------------------------------------------------------- */
+/* 原生黄果上游                                                                */
+/* -------------------------------------------------------------------------- */
+
+async function nativeList(upstream, typeId, page, origin, env) {
+  const type = typeId || "ai-duanju";
+  let url = `${upstream.api}/api/category/${encodeURIComponent(type)}?page=${page}&size=50&sort=latest`;
+
+  if (type.startsWith("rank:")) {
+    const kind = type.slice("rank:".length) || "hot";
+    url = `${upstream.api}/api/ranks/${encodeURIComponent(kind)}?page=${page}&size=50`;
+  } else if (type.startsWith("chigua")) {
+    const cate = type.split(":")[1] || "all";
+    url = `${upstream.api}/api/chigua?cate=${encodeURIComponent(cate)}&page=${page}&size=50`;
   }
 
-  if (!item) return null;
+  const { data } = await requestUpstreamJson(upstream, url, env);
+  const list = (Array.isArray(data.list) ? data.list : [])
+    .map((item) => toNativeVod(item, upstream, origin, false))
+    .filter((item) => item.vod_id && item.vod_name)
+    .map((item) => ({ ...item, vod_id: namespaceId(upstream, item.vod_id) }));
+  const pageCount = Number(data.pagecount) || page;
+  return { list, pageCount };
+}
+
+async function nativeSearch(upstream, keyword, origin, env) {
+  const warnings = [];
+  let list = [];
+
+  try {
+    const { data } = await requestUpstreamJson(
+      upstream,
+      `${upstream.api}/api/search/${encodeURIComponent(keyword)}?page=1&size=50`,
+      env,
+      { timeoutMs: searchTimeout(env) }
+    );
+    if (Array.isArray(data.list)) {
+      list = data.list
+        .map((item) => toNativeVod(item, upstream, origin, false))
+        .filter((item) => item.vod_id && item.vod_name);
+    }
+  } catch (error) {
+    warnings.push(error.toJSON ? error.toJSON() : null);
+  }
+
+  if (!list.length) {
+    try {
+      const { data } = await requestUpstreamJson(
+        upstream,
+        `${upstream.site}/api/search?q=${encodeURIComponent(keyword)}&page=1&size=50`,
+        env,
+        { timeoutMs: searchTimeout(env) }
+      );
+      const items = data && data.data && data.data.items;
+      if (Array.isArray(items)) {
+        list = items
+          .map((item) => toNativeVod(item, upstream, origin, true))
+          .filter((item) => item.vod_id && item.vod_name);
+      }
+    } catch (error) {
+      warnings.push(error.toJSON ? error.toJSON() : null);
+    }
+  }
+
+  if (!list.length && warnings.length === 2) {
+    const first = warnings[0] || {};
+    const second = warnings[1] || {};
+    const summary = `Worker 搜索失败（${first.message || "未知"}）；站点搜索失败（${second.message || "未知"}）`;
+    throw new UpstreamError(upstream, first.kind || "search", summary, {
+      status: first.status,
+      ms: (first.ms || 0) + (second.ms || 0),
+      summary,
+    });
+  }
+
+  return {
+    list: list
+      .filter((item) => item.vod_id && item.vod_name)
+      .map((item) => ({ ...item, vod_id: namespaceId(upstream, item.vod_id) })),
+    warnings: warnings.filter(Boolean),
+  };
+}
+
+async function resolvePlay(upstream, id, ep, env) {
+  try {
+    const { data } = await requestUpstreamJson(
+      upstream,
+      `${upstream.api}/api/play?url=${encodeURIComponent(id)}&ep=${encodeURIComponent(ep)}`,
+      env
+    );
+    return typeof data.url === "string" ? data.url : "";
+  } catch {
+    return "";
+  }
+}
+
+async function nativeDetail(upstream, id, origin, env) {
+  const { data } = await requestUpstreamJson(
+    upstream,
+    `${upstream.api}/api/detail/${encodeURIComponent(id)}`,
+    env
+  );
+  const item = (Array.isArray(data.list) && data.list[0]) || null;
+  if (!item) return { status: "not_found" };
 
   const episodes = Array.isArray(item.episodes) ? item.episodes.slice(0, 50) : [];
-
-  // 并行解析播放地址，避免 30 集串行请求导致详情页很慢
   const resolved = await mapLimit(episodes, 8, async (ep, index) => {
     const epNumber = String(ep.ep || index + 1);
     let url = String(ep.url || "");
-    // 详情里的 ep.url 经常是 /video/xxx/ep-2/ 这种网页地址，
-    // 只有 m3u8/mp4 这类直链才直接使用，否则必须走 /api/play 解析。
     if (!/\.(m3u8|mp4|flv|mkv|webm)(\?|#|$)/i.test(url)) {
-      url = await resolvePlay(id, epNumber, config);
+      url = await resolvePlay(upstream, id, epNumber, env);
     }
-    if (!url || !/^https?:\/\//i.test(url)) return "";
-
+    if (!isHttpUrl(url)) return "";
     const title = String(ep.title || `第${epNumber}集`).replace(/\$/g, " ");
     return `${title}$${url}`;
   });
+
   const playUrls = resolved.filter(Boolean);
 
-  // 吃瓜图文帖：正文/帖子接口里才有 video_url
-  if (!playUrls.length && id.startsWith("archives_")) {
-    const pid = id.slice("archives_".length);
+  // 吃瓜图文帖：正文/帖子接口里才有 video_url。
+  if (!playUrls.length && String(id).startsWith("archives_")) {
+    const pid = String(id).slice("archives_".length);
     try {
-      const data = await fetchJson(
-        `${config.site}/api/posts/${encodeURIComponent(pid)}`,
-        `${config.site}/`
+      const { data: post } = await requestUpstreamJson(
+        upstream,
+        `${upstream.site}/api/posts/${encodeURIComponent(pid)}`,
+        env
       );
-      let url = String(data?.data?.video_url || "");
+      let url = String((post.data && post.data.video_url) || "");
       if (!url) {
-        const matched = String(data?.data?.content || "").match(
+        const matched = String((post.data && post.data.content) || "").match(
           /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i
         );
         if (matched) url = matched[0].replace(/&amp;/g, "&");
       }
-      if (/^https?:\/\//i.test(url)) playUrls.push(`第1集$${url}`);
-    } catch (error) {
-      console.warn("吃瓜帖子解析失败:", error);
+      if (isHttpUrl(url)) playUrls.push(`第1集$${url}`);
+    } catch {
+      // 帖子兜底失败不单独覆盖主错误，最终会以 no_playable 返回。
     }
   }
 
-  if (!playUrls.length) return null;
+  if (!playUrls.length) {
+    throw new UpstreamError(
+      upstream,
+      "no_playable",
+      "详情存在，但未解析到可播放地址",
+      { status: 200 }
+    );
+  }
 
   return {
-    ...toVod(item, config, false, origin),
-    vod_id: String(item.vod_id || id),
-    vod_play_from: "黄果",
-    vod_play_url: playUrls.join("#"),
+    status: "ok",
+    vod: {
+      ...toNativeVod(item, upstream, origin, false),
+      vod_id: String(item.vod_id || id),
+      vod_play_from: "黄果",
+      vod_play_url: playUrls.join("#"),
+    },
   };
 }
 
-const HUANGGUO_CLASSES = [
-  { type_id: "ai-duanju", type_name: "AI短剧" },
-  { type_id: "ai-manju", type_name: "AI漫剧" },
-  { type_id: "ai-huanlian", type_name: "换脸专区" },
-  { type_id: "ai-mogai", type_name: "魔改专区" },
-  { type_id: "chigua", type_name: "吃瓜·全部" },
-  { type_id: "rank:hot", type_name: "热播榜" },
-  { type_id: "rank:recommend", type_name: "推荐榜" },
-  { type_id: "rank:potential", type_name: "潜力榜" },
-];
+/* -------------------------------------------------------------------------- */
+/* MacCMS 上游                                                                 */
+/* -------------------------------------------------------------------------- */
 
-async function homeList(typeId, page, config, origin) {
-  const type = typeId || "ai-duanju";
-  let url = `${config.api}/api/category/${encodeURIComponent(type)}?page=${page}&size=50&sort=latest`;
+function maccmsUrl(upstream, params) {
+  const url = new URL(upstream.endpoint);
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value === undefined || value === null || value === "") continue;
+    url.searchParams.set(key, String(value));
+  }
+  return url.toString();
+}
 
-  if (type.startsWith("rank:")) {
-    const kind = type.slice("rank:".length) || "hot";
-    url = `${config.api}/api/ranks/${encodeURIComponent(kind)}?page=${page}&size=50`;
-  } else if (type.startsWith("chigua")) {
-    const cate = type.split(":")[1] || "all";
-    url = `${config.api}/api/chigua?cate=${encodeURIComponent(cate)}&page=${page}&size=50`;
+async function maccmsClasses(upstream, env) {
+  const { data } = await requestUpstreamJson(
+    upstream,
+    maccmsUrl(upstream, { ac: "list" }),
+    env
+  );
+
+  if (Array.isArray(data.class)) {
+    return data.class
+      .filter((item) => item && item.type_id != null && item.type_name)
+      .map((item) => ({
+        type_id: String(item.type_id),
+        type_name: String(item.type_name),
+      }));
+  }
+
+  // 部分 api/json.php 实现把 ac=list 当成列表接口，用列表里的类型反推分类。
+  const seen = new Set();
+  const classes = [];
+  for (const item of Array.isArray(data.list) ? data.list : []) {
+    const typeId = item && item.type_id != null ? String(item.type_id) : "";
+    const typeName = item && item.type_name ? String(item.type_name) : "";
+    if (!typeId || !typeName || seen.has(typeId)) continue;
+    seen.add(typeId);
+    classes.push({ type_id: typeId, type_name: typeName });
+  }
+  return classes;
+}
+
+async function maccmsList(upstream, typeId, page, origin, env) {
+  let { data } = await requestUpstreamJson(
+    upstream,
+    maccmsUrl(upstream, {
+      ac: "videolist",
+      pg: page,
+      t: typeId,
+    }),
+    env
+  );
+
+  // 少数 CMS 只接受 ac=detail 做列表查询。
+  if (
+    page === 1 &&
+    (!Array.isArray(data.list) || data.list.length === 0) &&
+    typeId
+  ) {
+    const fallback = await requestUpstreamJson(
+      upstream,
+      maccmsUrl(upstream, { ac: "detail", pg: 1, t: typeId }),
+      env
+    );
+    if (Array.isArray(fallback.data.list) && fallback.data.list.length > 0) {
+      data = fallback.data;
+    }
+  }
+
+  const list = (Array.isArray(data.list) ? data.list : [])
+    .map((item) => toMaccmsVod(item, upstream, origin))
+    .filter((item) => item.vod_id && item.vod_name)
+    .map((item) => ({ ...item, vod_id: namespaceId(upstream, item.vod_id) }));
+
+  return {
+    list,
+    pageCount: Number(data.pagecount) || page,
+  };
+}
+
+async function maccmsSearch(upstream, keyword, origin, env) {
+  const { data } = await requestUpstreamJson(
+    upstream,
+    maccmsUrl(upstream, { ac: "videolist", wd: keyword, pg: 1 }),
+    env,
+    { timeoutMs: searchTimeout(env) }
+  );
+
+  const list = (Array.isArray(data.list) ? data.list : [])
+    .map((item) => toMaccmsVod(item, upstream, origin))
+    .filter((item) => item.vod_id && item.vod_name)
+    .map((item) => ({ ...item, vod_id: namespaceId(upstream, item.vod_id) }));
+
+  return { list, warnings: [] };
+}
+
+async function maccmsDetail(upstream, ids, origin, env) {
+  const { data } = await requestUpstreamJson(
+    upstream,
+    maccmsUrl(upstream, { ac: "detail", ids }),
+    env
+  );
+  const item = (Array.isArray(data.list) && data.list[0]) || null;
+  if (!item) return { status: "not_found" };
+
+  const playUrl = String(item.vod_play_url || "");
+  if (!playUrl || !/https?:\/\//i.test(playUrl)) {
+    throw new UpstreamError(
+      upstream,
+      "no_playable",
+      "详情存在，但 vod_play_url 为空或不是 HTTP 地址",
+      { status: 200 }
+    );
+  }
+
+  const vod = toMaccmsVod(item, upstream, origin);
+  return {
+    status: "ok",
+    vod: {
+      ...vod,
+      vod_play_from: String(item.vod_play_from || upstream.name || "MacCMS"),
+      vod_play_url: playUrl,
+      vod_content: String(item.vod_content || item.vod_blurb || ""),
+    },
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* 聚合搜索                                                                    */
+/* -------------------------------------------------------------------------- */
+
+function searchErrorFor(errors, skipped) {
+  if (errors.length) {
+    const first = errors[0];
+    const summary = `搜索失败：${errors.length} 个上游不可用${
+      skipped ? `，${skipped} 个跳过` : ""
+    }（${summarizeKinds(errors)}）`;
+    return new UpstreamError(
+      { slug: first.upstream || "all", name: first.upstreamName || first.upstream || "all" },
+      first.kind || "search",
+      summary,
+      {
+        status: first.status,
+        ms: errors.reduce((sum, item) => sum + (item.ms || 0), 0),
+        summary,
+      }
+    );
+  }
+  return new UpstreamError(
+    "all",
+    "circuit_open",
+    `搜索失败：所有可搜索上游都在失败冷却中${skipped ? `（${skipped} 个）` : ""}`,
+    { ms: 0 }
+  );
+}
+
+async function searchAll(pool, keyword, origin, env) {
+  const candidates = pool.upstreams.filter(
+    (item) => item.searchable !== false && !isCircuitOpen(item)
+  );
+  let skipped = pool.upstreams.length - candidates.length;
+  const deadline = Date.now() + searchDeadlineMs(env);
+  const errors = [];
+  const warnings = [];
+
+  const results = await mapLimit(
+    candidates,
+    searchConcurrency(env),
+    async (upstream) => {
+      if (Date.now() >= deadline) {
+        skipped += 1;
+        return null;
+      }
+      try {
+        const result =
+          upstream.kind === "huangguo"
+            ? await nativeSearch(upstream, keyword, origin, env)
+            : await maccmsSearch(upstream, keyword, origin, env);
+        for (const warning of result.warnings || []) {
+          warnings.push({
+            ...warning,
+            upstream: warning.upstream || upstream.slug,
+          });
+        }
+        return { list: result.list || [], upstream };
+      } catch (error) {
+        const err =
+          error instanceof UpstreamError
+            ? error
+            : new UpstreamError(upstream, "upstream", String(error && error.message));
+        errors.push(err);
+        return null;
+      }
+    }
+  );
+
+  const successes = results.filter(Boolean);
+  const seen = new Set();
+  const list = [];
+  for (const result of successes) {
+    for (const item of result.list) {
+      if (!item.vod_id || seen.has(item.vod_id)) continue;
+      seen.add(item.vod_id);
+      list.push(item);
+    }
+  }
+
+  errors.sort((a, b) => String(a.upstream).localeCompare(String(b.upstream)));
+  warnings.sort((a, b) =>
+    String(a.upstream).localeCompare(String(b.upstream))
+  );
+
+  return {
+    list: list.slice(0, 300),
+    errors,
+    warnings,
+    skipped,
+    attempted: candidates.length,
+    succeeded: successes.length,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* 诊断                                                                        */
+/* -------------------------------------------------------------------------- */
+
+function upstreamReport(upstream) {
+  const state = healthState.get(upstream.slug);
+  const now = Date.now();
+  const open = !!state && state.circuitOpenUntil > now;
+  const status = statusOf(upstream);
+  return {
+    slug: upstream.slug,
+    key: upstream.key,
+    name: upstream.name,
+    kind: upstream.kind,
+    source: upstream.source,
+    host:
+      upstream.kind === "huangguo"
+        ? hostOf(upstream.api)
+        : hostOf(upstream.endpoint),
+    status,
+    latencyMs: state ? state.latencyMs : null,
+    lastCheckedAt: state ? isoTime(state.lastCheckedAt) : null,
+    lastSuccessAt: state ? isoTime(state.lastSuccessAt) : null,
+    lastError: state ? state.lastError : null,
+    consecutiveFailures: state ? state.consecutiveFailures : 0,
+    successes: state ? state.successes : 0,
+    circuitOpenUntil: open ? isoTime(state.circuitOpenUntil) : null,
+    cooldownRemainingMs: open
+      ? Math.max(0, state.circuitOpenUntil - now)
+      : 0,
+  };
+}
+
+async function probeUpstreams(pool, env) {
+  const deadline = Date.now() + DEFAULT_PROBE_DEADLINE_MS;
+  let skipped = 0;
+  const results = await mapLimit(pool.upstreams, 8, async (upstream) => {
+    if (Date.now() >= deadline) {
+      skipped += 1;
+      return false;
+    }
+    try {
+      if (upstream.kind === "huangguo") {
+        await requestUpstreamJson(
+          upstream,
+          `${upstream.api}/api/category/ai-duanju?page=1&size=1`,
+          env,
+          { timeoutMs: DEFAULT_PROBE_TIMEOUT_MS, bypassBreaker: true }
+        );
+      } else {
+        await requestUpstreamJson(
+          upstream,
+          maccmsUrl(upstream, { ac: "list" }),
+          env,
+          { timeoutMs: DEFAULT_PROBE_TIMEOUT_MS, bypassBreaker: true }
+        );
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  });
+
+  const ok = results.filter(Boolean).length;
+  return {
+    enabled: true,
+    attempted: pool.upstreams.length - skipped,
+    ok,
+    failed: results.length - ok - skipped,
+    skipped,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* 路由                                                                        */
+/* -------------------------------------------------------------------------- */
+
+function parseDetailIds(raw, pool, fallbackSlug) {
+  const pieces = String(raw || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (!pieces.length) return null;
+
+  const parsed = pieces.map((piece) => {
+    const index = piece.indexOf("~");
+    if (index > 0) {
+      return {
+        slug: piece.slice(0, index),
+        id: piece.slice(index + 1),
+        namespaced: true,
+      };
+    }
+    return { slug: "", id: piece, namespaced: false };
+  });
+
+  const namespaced = parsed.find((item) => item.namespaced);
+  const slug = namespaced ? namespaced.slug : fallbackSlug || "";
+  const upstream = upstreamBySlug(pool, slug);
+  if (!upstream) {
+    return {
+      error: new UpstreamError(
+        slug || "unknown",
+        "unknown_upstream",
+        `未知上游: ${slug || "(空)"}`
+      ),
+    };
+  }
+
+  if (
+    namespaced &&
+    parsed.some((item) => item.namespaced && item.slug !== namespaced.slug)
+  ) {
+    return {
+      error: new UpstreamError(
+        upstream,
+        "upstream",
+        "一次只能查询同一个上游的详情"
+      ),
+    };
+  }
+
+  const first = parsed[0];
+  const routedByPath = !first.namespaced && !!fallbackSlug;
+  return {
+    upstream,
+    ids: parsed.map((item) => item.id).join(","),
+    firstId: first.id,
+    displayId:
+      first.namespaced || routedByPath
+        ? `${upstream.slug}~${first.id}`
+        : String(raw).trim(),
+    count: parsed.length,
+  };
+}
+
+async function handleList(url, pool, env) {
+  const slug = requestedSlug(url);
+  const upstream = upstreamBySlug(pool, slug);
+  if (!upstream) {
+    return errorResponse(
+      new UpstreamError(slug, "unknown_upstream", `未知上游: ${slug}`)
+    );
+  }
+
+  if (upstream.kind === "huangguo") {
+    return jsonResponse({
+      code: 1,
+      msg: "数据列表",
+      class: HUANGGUO_CLASSES,
+      list: [],
+    });
   }
 
   try {
-    const data = await fetchJson(url, `${config.site}/`);
-    const list = Array.isArray(data?.list) ? data.list.map((item) => toVod(item, config, false, origin)) : [];
-    const pageCount = Number(data?.pagecount) || page;
-    return { list, pageCount };
+    const classes = await maccmsClasses(upstream, env);
+    return jsonResponse({ code: 1, msg: "数据列表", class: classes, list: [] });
   } catch (error) {
-    console.warn("Worker 首页列表失败:", error);
-    return { list: [], pageCount: page };
+    const err =
+      error instanceof UpstreamError
+        ? error
+        : new UpstreamError(upstream, "upstream", String(error && error.message));
+    return errorResponse(err);
   }
 }
+
+async function handleDetailList(url, pool, env) {
+  const keyword = String(url.searchParams.get("wd") || "").trim();
+  const origin = url.origin;
+
+  if (keyword) {
+    const slug = requestedSlug(url);
+    const upstream = upstreamBySlug(pool, slug);
+    if (!upstream) {
+      return errorResponse(
+        new UpstreamError(slug, "unknown_upstream", `未知上游: ${slug}`)
+      );
+    }
+
+    if (slug) {
+      try {
+        const result =
+          upstream.kind === "huangguo"
+            ? await nativeSearch(upstream, keyword, origin, env)
+            : await maccmsSearch(upstream, keyword, origin, env);
+        return jsonResponse({
+          code: 1,
+          msg: "数据列表",
+          page: 1,
+          pagecount: 1,
+          limit: result.list.length,
+          total: result.list.length,
+          list: result.list,
+          ...(result.warnings && result.warnings.length
+            ? { warnings: result.warnings }
+            : {}),
+        });
+      } catch (error) {
+        const err =
+          error instanceof UpstreamError
+            ? error
+            : new UpstreamError(upstream, "upstream", String(error && error.message));
+        return errorResponse(err);
+      }
+    }
+
+    const result = await searchAll(pool, keyword, origin, env);
+    if (!result.succeeded && (result.errors.length || result.skipped)) {
+      const err = searchErrorFor(result.errors, result.skipped);
+      return errorResponse(err, {
+        errors: result.errors.map((item) => item.toJSON()),
+        skipped: result.skipped,
+      });
+    }
+
+    const partial = result.errors.length > 0;
+    return jsonResponse({
+      code: 1,
+      msg: partial
+        ? `数据列表（${result.errors.length} 个上游失败）`
+        : "数据列表",
+      page: 1,
+      pagecount: 1,
+      limit: result.list.length,
+      total: result.list.length,
+      list: result.list,
+      ...(partial ? { partial: true, errors: result.errors.map((item) => item.toJSON()) } : {}),
+      ...(result.warnings.length ? { warnings: result.warnings } : {}),
+      ...(result.skipped ? { skipped: result.skipped } : {}),
+    });
+  }
+
+  const slug = requestedSlug(url);
+  const upstream = upstreamBySlug(pool, slug);
+  if (!upstream) {
+    return errorResponse(
+      new UpstreamError(slug, "unknown_upstream", `未知上游: ${slug}`)
+    );
+  }
+
+  const page = Math.max(1, Number(url.searchParams.get("pg")) || 1);
+  const typeId = url.searchParams.get("t") || (upstream.kind === "huangguo" ? "ai-duanju" : "");
+
+  try {
+    const result =
+      upstream.kind === "huangguo"
+        ? await nativeList(upstream, typeId, page, origin, env)
+        : await maccmsList(upstream, typeId, page, origin, env);
+    return jsonResponse({
+      code: 1,
+      msg: "数据列表",
+      page,
+      pagecount: result.pageCount,
+      limit: result.list.length,
+      total: result.list.length,
+      list: result.list,
+    });
+  } catch (error) {
+    const err =
+      error instanceof UpstreamError
+        ? error
+        : new UpstreamError(upstream, "upstream", String(error && error.message));
+    return errorResponse(err);
+  }
+}
+
+async function handleDetail(url, pool, env) {
+  const parsed = parseDetailIds(
+    url.searchParams.get("ids"),
+    pool,
+    requestedSlug(url)
+  );
+  if (!parsed) {
+    return jsonResponse({ code: 1, msg: "缺少 ids", list: [] });
+  }
+  if (parsed.error) return errorResponse(parsed.error);
+
+  const { upstream } = parsed;
+  try {
+    const result =
+      upstream.kind === "huangguo"
+        ? await nativeDetail(upstream, parsed.firstId, url.origin, env)
+        : await maccmsDetail(upstream, parsed.ids, url.origin, env);
+
+    if (result.status === "not_found") {
+      return jsonResponse({
+        code: 1,
+        msg: "没有找到内容",
+        page: 1,
+        pagecount: 0,
+        limit: 0,
+        total: 0,
+        list: [],
+      });
+    }
+
+    const vod = { ...result.vod, vod_id: parsed.displayId };
+    return jsonResponse({
+      code: 1,
+      msg: "数据列表",
+      page: 1,
+      pagecount: 1,
+      limit: 1,
+      total: 1,
+      list: [vod],
+    });
+  } catch (error) {
+    const err =
+      error instanceof UpstreamError
+        ? error
+        : new UpstreamError(upstream, "upstream", String(error && error.message));
+    return errorResponse(err);
+  }
+}
+
+async function handleUpstreams(url, pool, env) {
+  const probe =
+    /^(1|true|all|yes)$/i.test(String(url.searchParams.get("probe") || ""));
+  const probeResult = probe
+    ? await probeUpstreams(pool, env)
+    : { enabled: false, attempted: 0, ok: 0, failed: 0, skipped: 0 };
+
+  const reports = pool.upstreams.map(upstreamReport);
+  const counts = { ok: 0, degraded: 0, circuit_open: 0, unknown: 0 };
+  for (const report of reports) {
+    counts[report.status] = (counts[report.status] || 0) + 1;
+  }
+
+  return jsonResponse({
+    code: 1,
+    msg: "上游状态",
+    defaultSlug: defaultUpstream(pool) && defaultUpstream(pool).slug,
+    source: pool.source,
+    updatedAt: isoTime(pool.updatedAt),
+    expiresAt: isoTime(pool.expiresAt),
+    ttlMs: pool.expiresAt ? Math.max(0, pool.expiresAt - Date.now()) : null,
+    count: reports.length,
+    counts,
+    probe: probeResult,
+    upstreams: reports,
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* 图片代理                                                                    */
+/* -------------------------------------------------------------------------- */
+
+async function handleMedia(url, pool) {
+  const src = url.searchParams.get("src") || "";
+  if (!isHttpUrl(src)) {
+    return jsonResponse({ error: "缺少有效的图片地址" }, 400);
+  }
+
+  const slug = url.searchParams.get("up") || requestedSlug(url);
+  const upstream = upstreamBySlug(pool, slug) || defaultUpstream(pool);
+  const referer = upstream ? `${upstream.site || originOf(upstream.api)}/` : `${DEFAULT_SITE}/`;
+
+  try {
+    const response = await fetchWithTimeout(
+      src,
+      { headers: { "User-Agent": UA, Referer: referer } },
+      15000
+    );
+    const headers = new Headers(response.headers);
+    for (const [key, value] of Object.entries(CORS)) headers.set(key, value);
+    headers.delete("content-length");
+    headers.delete("content-encoding");
+    headers.delete("transfer-encoding");
+    headers.set("Cache-Control", "public, max-age=86400");
+    return new Response(response.body, {
+      status: response.status,
+      headers,
+    });
+  } catch (error) {
+    return jsonResponse(
+      { error: "图片代理失败", message: error && error.message },
+      502
+    );
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* 入口                                                                        */
+/* -------------------------------------------------------------------------- */
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -336,87 +1850,34 @@ export async function onRequest(context) {
     return jsonResponse({ error: access.error }, access.status);
   }
 
-  if (typeof context.waitUntil === "function") {
-    context.waitUntil(refreshConfig().catch(() => {}));
-  }
-
-  // 封面/图片同域代理，浏览器不直接访问 Worker 域名
-  if (url.pathname.endsWith("/huangguo/media")) {
-    const src = url.searchParams.get("src") || "";
-    if (!/^https?:\/\//i.test(src)) {
-      return jsonResponse({ error: "缺少有效的图片地址" }, 400);
-    }
-    try {
-      const config = await getConfig();
-      const response = await fetch(src, {
-        headers: { "User-Agent": UA, "Referer": `${config.site}/` },
-        signal: AbortSignal.timeout(15000),
-      });
-      const headers = new Headers(response.headers);
-      for (const [key, value] of Object.entries(CORS)) headers.set(key, value);
-      headers.delete("content-length");
-      headers.delete("content-encoding");
-      headers.delete("transfer-encoding");
-      headers.set("Cache-Control", "public, max-age=86400");
-      return new Response(response.body, {
-        status: response.status,
-        headers,
-      });
-    } catch (error) {
-      return jsonResponse({ error: "图片代理失败", message: error.message }, 502);
-    }
-  }
-
   const ac = url.searchParams.get("ac");
-  const config = await getConfig();
+  const mediaPath = url.pathname.replace(/\/+$/, "");
+  const isMedia =
+    mediaPath === "/huangguo/media" || mediaPath.endsWith("/huangguo/media");
+
+  // 诊断端点首次访问时等待一次池刷新，保证能立即看到全部候选上游。
+  const pool = await getPool(env, context, {
+    awaitRefresh: ac === "upstreams" && !isMedia,
+  });
+
+  if (isMedia) {
+    return handleMedia(url, pool);
+  }
 
   if (ac === "list") {
-    return jsonResponse({ code: 1, msg: "数据列表", class: HUANGGUO_CLASSES, list: [] });
+    return handleList(url, pool, env);
+  }
+
+  if (ac === "upstreams") {
+    return handleUpstreams(url, pool, env);
   }
 
   if (ac === "videolist" || (ac === "detail" && !url.searchParams.get("ids"))) {
-    const keyword = url.searchParams.get("wd") || "";
-    if (keyword.trim()) {
-      const list = await search(keyword.trim(), config, url.origin);
-      return jsonResponse({
-        code: 1,
-        msg: "数据列表",
-        page: 1,
-        pagecount: 1,
-        limit: list.length,
-        total: list.length,
-        list,
-      });
-    }
-
-    const page = Math.max(1, Number(url.searchParams.get("pg")) || 1);
-    const typeId = url.searchParams.get("t") || "ai-duanju";
-    const home = await homeList(typeId, page, config, url.origin);
-    return jsonResponse({
-      code: 1,
-      msg: "数据列表",
-      page,
-      pagecount: home.pageCount,
-      limit: home.list.length,
-      total: home.list.length,
-      list: home.list,
-    });
+    return handleDetailList(url, pool, env);
   }
 
   if (ac === "detail") {
-    const ids = url.searchParams.get("ids") || "";
-    if (!ids.trim()) return jsonResponse({ code: 1, msg: "缺少 ids", list: [] });
-
-    const detail = await buildDetail(ids.trim(), config, url.origin);
-    return jsonResponse({
-      code: 1,
-      msg: detail ? "数据列表" : "没有找到内容",
-      page: 1,
-      pagecount: 1,
-      limit: detail ? 1 : 0,
-      total: detail ? 1 : 0,
-      list: detail ? [detail] : [],
-    });
+    return handleDetail(url, pool, env);
   }
 
   return jsonResponse({ code: 0, msg: "不支持的 ac 参数", list: [] });

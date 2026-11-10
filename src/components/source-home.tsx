@@ -28,9 +28,11 @@ interface SourceItem {
 
 interface SourceListResponse {
   code?: number;
+  msg?: string;
   list?: SourceItem[];
   pagecount?: number;
   total?: number;
+  error?: { kind?: string; message?: string; upstream?: string };
 }
 
 const DOUBAN_KEY = "__douban__";
@@ -46,7 +48,7 @@ function readArray(key: string): ApiSite[] {
 }
 
 function buildApiUrl(api: string, query: string): string {
-  let base = api.trim().replace(/\/+$/, "").replace(/[?&]+$/, "");
+  const base = api.trim().replace(/\/+$/, "").replace(/[?&]+$/, "");
   const fullEndpoint =
     /\.php$/i.test(base) ||
     /\/api\/json$/i.test(base) ||
@@ -66,7 +68,11 @@ async function fetchApi(targetUrl: string): Promise<SourceListResponse> {
     : await fetchWithProxy(targetUrl);
 
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  return response.json();
+  const data: SourceListResponse = await response.json();
+  if (data.code === 0) {
+    throw new Error(data.msg || data.error?.message || "加载失败");
+  }
+  return data;
 }
 
 function buildSources(): ApiSite[] {
@@ -169,7 +175,6 @@ export default function SourceHome() {
     setError("");
     loadCategories(site);
     loadList(site, "", 1, false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentKey, sources]);
 
   async function loadCategories(site: ApiSite) {

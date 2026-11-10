@@ -41,55 +41,71 @@
       })();
     </script>
     <script>
-      // 从上游最新 tag 同步 type 1 采集站（6 小时缓存，避免每次打开都阻塞）
+      // 上游池由服务端定时/后台同步，前端只异步读取诊断接口，不再用同步 XHR 阻塞首屏。
       (function () {
-        try {
-          var CACHE_KEY = "remoteSourcesUpdatedAt";
-          var last = Number(localStorage.getItem(CACHE_KEY) || 0);
-          if (Date.now() - last < 6 * 60 * 60 * 1000) return;
+        function syncUpstreams() {
+          fetch("/huangguo/?ac=upstreams", {
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { Accept: "application/json" },
+          })
+            .then(function (response) {
+              return response.ok ? response.json() : null;
+            })
+            .then(function (data) {
+              if (!data || !Array.isArray(data.upstreams)) return;
+              try {
+                // 诊断信息只保留轻量字段，供设置页/控制台排查。
+                localStorage.setItem(
+                  "huangguoUpstreams",
+                  JSON.stringify({
+                    updatedAt: data.updatedAt,
+                    defaultSlug: data.defaultSlug,
+                    count: data.count,
+                    upstreams: data.upstreams.map(function (item) {
+                      return {
+                        slug: item.slug,
+                        name: item.name,
+                        status: item.status,
+                        latencyMs: item.latencyMs,
+                        lastError: item.lastError,
+                      };
+                    }),
+                  })
+                );
 
-          var proxyBase = localStorage.getItem("PROXY_BASE_URL") || "/proxy/";
-          if (proxyBase.slice(-1) !== "/") proxyBase += "/";
+                // 清掉旧版同步 XHR 注入的 remote_* 直连源，避免浏览器继续直连上游。
+                var custom = JSON.parse(localStorage.getItem("customApiSites") || "[]");
+                if (!Array.isArray(custom)) custom = [];
+                var kept = custom.filter(function (site) {
+                  return site && String(site.key).indexOf("remote_") !== 0;
+                });
+                if (kept.length !== custom.length) {
+                  localStorage.setItem("customApiSites", JSON.stringify(kept));
+                }
 
-          var upstream =
-            "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/all_sources_config.json";
-
-          var xhr = new XMLHttpRequest();
-          xhr.open("GET", proxyBase + encodeURIComponent(upstream), false);
-          xhr.send(null);
-          if (xhr.status < 200 || xhr.status >= 300) return;
-
-          var data = JSON.parse(xhr.responseText);
-          var sites = Array.isArray(data.sites) ? data.sites : [];
-          var remote = [];
-          sites.forEach(function (site) {
-            if (Number(site.type) !== 1) return;
-            var api = String(site.api || "").trim().replace(/\/+$/, "");
-            var base = "";
-            if (/\/api\.php\/provide\/vod$/i.test(api)) {
-              base = api.replace(/\/api\.php\/provide\/vod$/i, "");
-            } else if (/^https?:\/\/[^/]+$/i.test(api)) {
-              base = api;
-            }
-            // 其他自定义接口路径（api/json.php 等）暂时跳过
-            if (!base) return;
-            remote.push({
-              key: "remote_" + site.key,
-              name: site.name,
-              api: base,
-              isCustom: true,
+                var selected = JSON.parse(localStorage.getItem("selectedApiSites") || "[]");
+                if (Array.isArray(selected)) {
+                  var selectedKept = selected.filter(function (key) {
+                    return String(key).indexOf("remote_") !== 0;
+                  });
+                  if (selectedKept.length !== selected.length) {
+                    localStorage.setItem("selectedApiSites", JSON.stringify(selectedKept));
+                  }
+                }
+              } catch (error) {
+                console.warn("保存上游诊断信息失败:", error);
+              }
+            })
+            .catch(function () {
+              // 鉴权未通过或网络不可用时保持静默。
             });
-          });
+        }
 
-          var custom = JSON.parse(localStorage.getItem("customApiSites") || "[]");
-          if (!Array.isArray(custom)) custom = [];
-          custom = custom.filter(function (site) {
-            return site && String(site.key).indexOf("remote_") !== 0;
-          });
-          localStorage.setItem("customApiSites", JSON.stringify(custom.concat(remote)));
-          localStorage.setItem(CACHE_KEY, String(Date.now()));
-        } catch (error) {
-          console.warn("同步远程采集站失败:", error);
+        if (document.readyState === "complete") {
+          setTimeout(syncUpstreams, 0);
+        } else {
+          window.addEventListener("load", syncUpstreams, { once: true });
         }
       })();
     </script>

@@ -328,8 +328,10 @@ export default function SearchResultsPage() {
     // 遍历每个消息容器
     $(".tgme_widget_message_wrap").each((_: unknown, element: unknown) => {
    
-      const messageEl = $(element as any);
-    
+      const messageEl = $(
+        element as Parameters<ReturnType<typeof cheerio.load>>[0]
+      );
+
       // 发布时间
       const pubDate = messageEl.find("time").attr("datetime") || new Date().toISOString();
       // 标题（第一个<br>前的内容）
@@ -337,7 +339,13 @@ export default function SearchResultsPage() {
       const title = html.split("<br>")[0]?.replace(/<[^>]+>/g, "").replace(/\n/g, "").trim() || "";
 
       // 云盘链接
-      const links = messageEl.find(".tgme_widget_message_text a").map((_: unknown, el: unknown) => (el as any).href || (el as any).attribs?.href || "").get();
+      const links = messageEl
+        .find(".tgme_widget_message_text a")
+        .map((_: unknown, el: unknown) => {
+          const node = el as { href?: string; attribs?: { href?: string } };
+          return node.href || node.attribs?.href || "";
+        })
+        .get();
       
       // 只保留平台能识别的云盘链接
       const validLinks = (links as string[]).filter((link: string) => {
