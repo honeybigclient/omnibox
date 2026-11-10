@@ -840,7 +840,101 @@ function PlayerPage() {
 
       playerRef.current = art;
 
+      // --- 记住用户设定倍速：换集/换片继续沿用 ---
+      let holdPrevRate = 0;
+      let holding = false;
+      try {
+        const storedRate = Number(localStorage.getItem("playerRate") || "0");
+        if (storedRate >= 0.25 && storedRate <= 3) art.playbackRate = storedRate;
+      } catch {
+        // 隐私模式忽略
+      }
+
+      art.on("video:ratechange", () => {
+        if (holding) return; // 按住加速不算"用户设定"
+        const rate = art.playbackRate;
+        if (rate && rate >= 0.25) {
+          try {
+            localStorage.setItem("playerRate", String(rate));
+          } catch {
+            // 忽略写入失败
+          }
+        }
+      });
+
+      // --- 安卓壳（大肥鱼影视 App）用的桥 ---
+      type NativeBridge = { setFullscreen?: (fullscreen: boolean) => void };
+      const nativeBridge = (window as unknown as { OmniboxNative?: NativeBridge })
+        .OmniboxNative;
+
+      const playerBridge = {
+        time: () => art.currentTime || 0,
+        duration: () => art.duration || 0,
+        seekBy: (delta: number) => {
+          const duration = art.duration || 0;
+          let next = (art.currentTime || 0) + (Number(delta) || 0);
+          if (next < 0) next = 0;
+          if (duration > 0 && next > duration - 0.3) next = Math.max(0, duration - 0.3);
+          art.currentTime = next;
+          return next;
+        },
+        setRate: (rate: number) => {
+          const value = Math.min(3, Math.max(0.25, Number(rate) || 1));
+          art.playbackRate = value;
+          try {
+            localStorage.setItem("playerRate", String(value));
+          } catch {
+            // 忽略
+          }
+          return value;
+        },
+        getRate: () => art.playbackRate || 1,
+        // 按住屏幕加速：记住原倍速，松开恢复
+        hold: (on: boolean) => {
+          if (on) {
+            if (!holding) {
+              holding = true;
+              holdPrevRate = art.playbackRate || 1;
+            }
+            art.playbackRate = 1.5;
+          } else if (holding) {
+            holding = false;
+            art.playbackRate = holdPrevRate || 1;
+          }
+          return art.playbackRate;
+        },
+        exitFullscreen: () => {
+          if (art.fullscreenWeb) art.fullscreenWeb = false;
+          if (art.fullscreen) art.fullscreen = false;
+        },
+        isFullscreen: () => !!(art.fullscreen || art.fullscreenWeb),
+      };
+      (
+        window as unknown as { OmniboxPlayer?: typeof playerBridge }
+      ).OmniboxPlayer = playerBridge;
+
+      // 网页 CSS 全屏时通知安卓壳：这样竖屏全屏也有返回键和手势（且不吞掉网页点击）。
+      let lastCssFullscreen = false;
+      const fullscreenTimer = window.setInterval(() => {
+        const cssFullscreen = !!art.fullscreenWeb;
+        if (cssFullscreen === lastCssFullscreen) return;
+        lastCssFullscreen = cssFullscreen;
+        try {
+          nativeBridge?.setFullscreen?.(cssFullscreen);
+        } catch {
+          // 非 App 环境忽略
+        }
+      }, 400);
+
       return () => {
+        window.clearInterval(fullscreenTimer);
+        try {
+          nativeBridge?.setFullscreen?.(false);
+        } catch {
+          // 忽略
+        }
+        const holder = window as unknown as { OmniboxPlayer?: unknown };
+        if (holder.OmniboxPlayer === playerBridge) delete holder.OmniboxPlayer;
         if (art) {
           art.destroy();
         }
