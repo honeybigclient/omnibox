@@ -66,6 +66,7 @@
                       return {
                         slug: item.slug,
                         name: item.name,
+                        kind: item.kind,
                         status: item.status,
                         latencyMs: item.latencyMs,
                         lastError: item.lastError,
@@ -74,27 +75,58 @@
                   })
                 );
 
-                // 清掉旧版同步 XHR 注入的 remote_* 直连源，避免浏览器继续直连上游。
+                // 只拿到默认上游时不重建列表，避免一次同步失败把已有源清空。
+                if (data.upstreams.length < 2) return;
+
+                var origin = location.origin;
+                var managed = [];
+                data.upstreams.forEach(function (item) {
+                  if (!item || !item.slug) return;
+                  // 默认黄果继续用同步注册的 key=huangguo 源，避免重复。
+                  if (item.kind === "huangguo" || item.slug === data.defaultSlug) return;
+                  managed.push({
+                    key: "hg_" + item.slug,
+                    name: item.name || item.slug,
+                    api: origin + "/huangguo/" + item.slug,
+                    isCustom: true,
+                  });
+                });
+                if (!managed.length) return;
+
+                // 把旧版 remote_* 直连源和上一轮 hg_* 源一起替换成走服务端适配层的源。
                 var custom = JSON.parse(localStorage.getItem("customApiSites") || "[]");
                 if (!Array.isArray(custom)) custom = [];
                 var kept = custom.filter(function (site) {
-                  return site && String(site.key).indexOf("remote_") !== 0;
+                  if (!site) return false;
+                  var key = String(site.key);
+                  return key.indexOf("remote_") !== 0 && key.indexOf("hg_") !== 0;
                 });
-                if (kept.length !== custom.length) {
-                  localStorage.setItem("customApiSites", JSON.stringify(kept));
-                }
+                localStorage.setItem(
+                  "customApiSites",
+                  JSON.stringify(kept.concat(managed))
+                );
 
+                var managedKeys = {};
+                managed.forEach(function (site) {
+                  managedKeys[site.key] = 1;
+                });
                 var selected = JSON.parse(localStorage.getItem("selectedApiSites") || "[]");
                 if (Array.isArray(selected)) {
                   var selectedKept = selected.filter(function (key) {
-                    return String(key).indexOf("remote_") !== 0;
+                    var value = String(key);
+                    if (value.indexOf("remote_") === 0) return false;
+                    if (value.indexOf("hg_") === 0) return !!managedKeys[value];
+                    return true;
                   });
                   if (selectedKept.length !== selected.length) {
                     localStorage.setItem("selectedApiSites", JSON.stringify(selectedKept));
                   }
                 }
+
+                // 通知已挂载的首页源选择器立即重读，不必刷新页面。
+                window.dispatchEvent(new Event("huangguo-upstreams-updated"));
               } catch (error) {
-                console.warn("保存上游诊断信息失败:", error);
+                console.warn("同步上游源列表失败:", error);
               }
             })
             .catch(function () {

@@ -44,13 +44,17 @@ async function syncAllowedSources() {
       (site) =>
         site?.key &&
         !String(site.key).startsWith("remote_") &&
-        site.key !== "huangguo" &&
         !extraKeys.has(site.key)
     );
 
+    // 保留本地 huangguo / hg_* 源，并按 key 去重，避免 /api/sources 同步时把它们冲掉。
+    const merged = new Map<string, ApiSite>();
+    for (const site of [...kept, ...extras]) {
+      if (site?.key) merged.set(site.key, site);
+    }
     localStorage.setItem(
       "customApiSites",
-      JSON.stringify([...kept, ...extras])
+      JSON.stringify([...merged.values()])
     );
   } catch {
     // 保留浏览器里已有的源
@@ -83,9 +87,19 @@ export function isAdmin(): boolean {
   return cached?.isAdmin === true;
 }
 
+function isHuangguoChild(key: string): boolean {
+  return String(key).startsWith("hg_");
+}
+
+function hasHuangguoAccess(): boolean {
+  return !!cached?.approved && cached.sources.includes("huangguo");
+}
+
 export function isAllowedSource(key: string): boolean {
   if (!cached) return true;
   if (cached.isAdmin || cached.sources.includes("*")) return true;
+  // 拥有 huangguo 权限即自动拥有所有 hg_* 子源；子源实际还是走 /huangguo 适配层。
+  if (hasHuangguoAccess() && isHuangguoChild(key)) return true;
   return cached.approved && cached.sources.includes(key);
 }
 

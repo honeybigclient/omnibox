@@ -19,7 +19,11 @@ export function getSelectedApiSites(): string[] {
   if (me.isAdmin || me.sources.includes('*')) return keys;
   if (!me.approved) return [];
 
-  const allowed = keys.filter((key) => me.sources.includes(key));
+  const allowed = keys.filter(
+    (key) =>
+      me.sources.includes(key) ||
+      (me.sources.includes("huangguo") && String(key).startsWith("hg_"))
+  );
   // 如果本地选中的源刚好都没有权限，默认用账号被授权的全部源
   return allowed.length ? allowed : me.sources;
 }

@@ -9,7 +9,8 @@ export interface Movie {
   type_name?: string;
   vod_play_url?: string;
   source?: string;
-  source_key?:string;
+  source_key?: string;
+  source_name?: string;
   vod_score?: string;
   vod_blurb?: string;
   vod_actor?: string;

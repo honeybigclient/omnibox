@@ -163,6 +163,26 @@ function namespaceId(upstream, id) {
   return raw.startsWith(prefix) ? raw : `${prefix}${raw}`;
 }
 
+function lazyPlayUrl(origin, upstream, id, ep) {
+  // 结尾必须是 .m3u8，Artplayer 靠扩展名选择 customType.m3u8 / Hls.js。
+  return `${origin}/huangguo/play.m3u8?up=${encodeURIComponent(
+    upstream.slug
+  )}&id=${encodeURIComponent(id)}&ep=${encodeURIComponent(ep)}`;
+}
+
+function searchSourceKey(upstream) {
+  return upstream.kind === "huangguo" ? "huangguo" : `hg_${upstream.slug}`;
+}
+
+function decorateSearchItem(item, upstream) {
+  return {
+    ...item,
+    source: upstream.name,
+    source_key: searchSourceKey(upstream),
+    source_name: upstream.name,
+  };
+}
+
 function normalizeBase(value) {
   return String(value || "").trim().replace(/\/+$/, "");
 }
@@ -232,6 +252,7 @@ class UpstreamError extends Error {
     this.ms = Math.max(0, Math.round(Number(options.ms) || 0));
     // 聚合错误需要覆盖默认的“上游 X 超时”文案。
     this.summary = options.summary || "";
+    this.details = options.details || null;
     if (options.cause) this.cause = options.cause;
   }
 
@@ -243,6 +264,7 @@ class UpstreamError extends Error {
       status: this.status,
       ms: this.ms,
       message: this.message,
+      ...(this.details ? { details: this.details } : {}),
     };
   }
 }
@@ -807,7 +829,14 @@ function requestedSlug(url) {
   const index = segments.lastIndexOf("huangguo");
   if (index >= 0) {
     const next = segments[index + 1];
-    if (next && next !== "api.php" && next !== "api" && next !== "media") {
+    if (
+      next &&
+      next !== "api.php" &&
+      next !== "api" &&
+      next !== "media" &&
+      next !== "play" &&
+      next !== "play.m3u8"
+    ) {
       return decodeURIComponent(next);
     }
   }
@@ -1051,6 +1080,13 @@ function isHttpUrl(value) {
   return /^https?:\/\//i.test(String(value || ""));
 }
 
+function isDirectMediaUrl(value) {
+  return (
+    isHttpUrl(value) &&
+    /\.(m3u8|mp4|flv|mkv|webm)(\?|#|$)/i.test(String(value || ""))
+  );
+}
+
 async function mapLimit(items, limit, mapper) {
   const results = new Array(items.length);
   let next = 0;
@@ -1152,20 +1188,163 @@ async function nativeSearch(upstream, keyword, origin, env) {
   };
 }
 
-async function resolvePlay(upstream, id, ep, env) {
+async function fetchPageStream(upstream, pageUrl, ep, timeoutMs) {
+  if (!isHttpUrl(pageUrl)) return "";
+  try {
+    const response = await fetchWithTimeout(
+      pageUrl,
+      {
+        headers: {
+          "User-Agent": UA,
+          Referer: `${upstream.site}/`,
+        },
+      },
+      timeoutMs
+    );
+    if (!response.ok) return "";
+    const html = await response.text();
+    const normalized = html.replace(/\\\//g, "/").replace(/\\u0026/g, "&");
+
+    const dataMatch = normalized.match(
+      /id=["']videoInitialData["'][^>]*>([\s\S]*?)<\/script>/i
+    );
+    if (dataMatch) {
+      try {
+        const data = JSON.parse(dataMatch[1]);
+        let stream = "";
+        if (Array.isArray(data.epPlaySrcs)) {
+          stream = data.epPlaySrcs[Number(ep) - 1] || data.epPlaySrcs[0] || "";
+        } else if (data.epPlaySrcs && typeof data.epPlaySrcs === "object") {
+          stream = data.epPlaySrcs[String(ep)] || data.epPlaySrcs[ep] || "";
+        }
+        if (!stream) stream = data.videoSrc || "";
+        stream = String(stream).trim();
+        if (isHttpUrl(stream)) return stream;
+      } catch {
+        // 继续用正则兜底。
+      }
+    }
+
+    const matched = normalized.match(
+      /https?:\/\/[^"'<>\s]+?\.(?:m3u8|mp4)(?:\?[^"'<>\s]*)?/i
+    );
+    if (matched) return matched[0].replace(/&amp;/g, "&");
+  } catch {
+    // 页面抓取失败就返回空，由调用方决定下一个兜底。
+  }
+  return "";
+}
+
+/**
+ * 把单集解析推迟到用户真正点播时。
+ *
+ * 旧实现会在详情阶段对最多 50 集并发调用 /api/play；Worker 现在每次 play
+ * 还会探测 m3u8 时长，50 个请求很容易超时，最后一集都拿不到，只能报
+ * no_playable。详情阶段改为生成 /huangguo/play.m3u8?... 的惰性地址，
+ * 点哪集解析哪集；解析顺序：Worker /api/play → 源站官方接口 → 页面兜底。
+ */
+async function resolveNativePlay(upstream, id, ep, env) {
+  const deadline = Date.now() + 25000;
+  const remaining = (max) =>
+    Math.max(1000, Math.min(max || 25000, deadline - Date.now()));
+  const archives = String(id).startsWith("archives_");
+
+  if (archives) {
+    const pid = String(id).slice("archives_".length);
+
+    // 吃瓜图文帖：Worker 的 detail 里可能直接带 episodes[0].url。
+    try {
+      const { data } = await requestUpstreamJson(
+        upstream,
+        `${upstream.api}/api/detail/${encodeURIComponent(id)}`,
+        env,
+        { timeoutMs: remaining(8000) }
+      );
+      const item = (Array.isArray(data.list) && data.list[0]) || null;
+      const url =
+        item && Array.isArray(item.episodes) && item.episodes[0]
+          ? String(item.episodes[0].url || "")
+          : "";
+      if (isDirectMediaUrl(url)) return url;
+    } catch {
+      // 继续尝试帖子接口。
+    }
+
+    try {
+      const { data } = await requestUpstreamJson(
+        upstream,
+        `${upstream.site}/api/posts/${encodeURIComponent(pid)}`,
+        env,
+        { timeoutMs: remaining(6000) }
+      );
+      let url = String((data.data && data.data.video_url) || "");
+      if (!url) {
+        const matched = String((data.data && data.data.content) || "").match(
+          /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i
+        );
+        if (matched) url = matched[0].replace(/&amp;/g, "&");
+      }
+      if (isHttpUrl(url)) return url;
+    } catch {
+      // 继续尝试吃瓜页面。
+    }
+
+    const archivePage = await fetchPageStream(
+      upstream,
+      `${upstream.site}/archives/${encodeURIComponent(pid)}/`,
+      "1",
+      remaining(6000)
+    );
+    if (archivePage) return archivePage;
+  }
+
   try {
     const { data } = await requestUpstreamJson(
       upstream,
       `${upstream.api}/api/play?url=${encodeURIComponent(id)}&ep=${encodeURIComponent(ep)}`,
-      env
+      env,
+      { timeoutMs: remaining(archives ? 8000 : 12000) }
     );
-    return typeof data.url === "string" ? data.url : "";
+
+    const direct = typeof data.url === "string" ? data.url.trim() : "";
+    const proxy = typeof data.proxy === "string" ? data.proxy.trim() : "";
+    if (
+      isHttpUrl(direct) &&
+      !(direct.startsWith("http://") && proxy.startsWith("https://"))
+    ) {
+      return direct;
+    }
+    if (isHttpUrl(proxy)) return proxy;
   } catch {
-    return "";
+    // Worker play 失败，继续问源站官方接口。
   }
+
+  // 旧版 Worker 的 /api/play 可能返回空 url；再直接问一次源站官方接口。
+  try {
+    const { data: siteData } = await requestUpstreamJson(
+      upstream,
+      `${upstream.site}/api/videos/${encodeURIComponent(id)}/play?ep=${encodeURIComponent(ep)}`,
+      env,
+      { timeoutMs: remaining(6000) }
+    );
+    const siteUrl = String(
+      (siteData.data && siteData.data.video_url) || siteData.video_url || ""
+    ).trim();
+    if (isHttpUrl(siteUrl)) return siteUrl;
+  } catch {
+    // 源站接口失败，继续页面兜底。
+  }
+
+  // 最后一层：直接抓详情页里的 videoInitialData / m3u8。
+  const pageUrl =
+    ep === "1"
+      ? `${upstream.site}/video/${encodeURIComponent(id)}/`
+      : `${upstream.site}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`;
+  return fetchPageStream(upstream, pageUrl, ep, remaining(6000));
 }
 
 async function nativeDetail(upstream, id, origin, env) {
+  const started = Date.now();
   const { data } = await requestUpstreamJson(
     upstream,
     `${upstream.api}/api/detail/${encodeURIComponent(id)}`,
@@ -1174,50 +1353,32 @@ async function nativeDetail(upstream, id, origin, env) {
   const item = (Array.isArray(data.list) && data.list[0]) || null;
   if (!item) return { status: "not_found" };
 
-  const episodes = Array.isArray(item.episodes) ? item.episodes.slice(0, 50) : [];
-  const resolved = await mapLimit(episodes, 8, async (ep, index) => {
+  let episodes = Array.isArray(item.episodes) ? item.episodes.slice(0, 100) : [];
+  if (!episodes.length && String(id).startsWith("archives_")) {
+    // 吃瓜详情可能没有 episodes，点播时再去 posts/detail 里找直链。
+    episodes = [{ ep: "1", title: "第1集", url: "" }];
+  }
+
+  if (!episodes.length) {
+    const summary = `上游「${upstream.name}」返回了详情，但 episodes 为空（可能已下架或详情接口异常）`;
+    throw new UpstreamError(upstream, "no_playable", summary, {
+      status: 200,
+      ms: Date.now() - started,
+      summary,
+      details: { id: String(id), episodes: 0 },
+    });
+  }
+
+  const playUrls = episodes.map((ep, index) => {
     const epNumber = String(ep.ep || index + 1);
-    let url = String(ep.url || "");
-    if (!/\.(m3u8|mp4|flv|mkv|webm)(\?|#|$)/i.test(url)) {
-      url = await resolvePlay(upstream, id, epNumber, env);
-    }
-    if (!isHttpUrl(url)) return "";
     const title = String(ep.title || `第${epNumber}集`).replace(/\$/g, " ");
+    let url = String(ep.url || "").trim();
+    if (url.startsWith("//")) url = `https:${url}`;
+    if (!isDirectMediaUrl(url)) {
+      url = lazyPlayUrl(origin, upstream, id, epNumber);
+    }
     return `${title}$${url}`;
   });
-
-  const playUrls = resolved.filter(Boolean);
-
-  // 吃瓜图文帖：正文/帖子接口里才有 video_url。
-  if (!playUrls.length && String(id).startsWith("archives_")) {
-    const pid = String(id).slice("archives_".length);
-    try {
-      const { data: post } = await requestUpstreamJson(
-        upstream,
-        `${upstream.site}/api/posts/${encodeURIComponent(pid)}`,
-        env
-      );
-      let url = String((post.data && post.data.video_url) || "");
-      if (!url) {
-        const matched = String((post.data && post.data.content) || "").match(
-          /https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i
-        );
-        if (matched) url = matched[0].replace(/&amp;/g, "&");
-      }
-      if (isHttpUrl(url)) playUrls.push(`第1集$${url}`);
-    } catch {
-      // 帖子兜底失败不单独覆盖主错误，最终会以 no_playable 返回。
-    }
-  }
-
-  if (!playUrls.length) {
-    throw new UpstreamError(
-      upstream,
-      "no_playable",
-      "详情存在，但未解析到可播放地址",
-      { status: 200 }
-    );
-  }
 
   return {
     status: "ok",
@@ -1433,7 +1594,8 @@ async function searchAll(pool, keyword, origin, env) {
     for (const item of result.list) {
       if (!item.vod_id || seen.has(item.vod_id)) continue;
       seen.add(item.vod_id);
-      list.push(item);
+      // 搜索页用 source_key 找到对应源的 API 基址，用 source_name 展示来源。
+      list.push(decorateSearchItem(item, result.upstream));
     }
   }
 
@@ -1637,14 +1799,15 @@ async function handleDetailList(url, pool, env) {
           upstream.kind === "huangguo"
             ? await nativeSearch(upstream, keyword, origin, env)
             : await maccmsSearch(upstream, keyword, origin, env);
+        const list = result.list.map((item) => decorateSearchItem(item, upstream));
         return jsonResponse({
           code: 1,
           msg: "数据列表",
           page: 1,
           pagecount: 1,
-          limit: result.list.length,
-          total: result.list.length,
-          list: result.list,
+          limit: list.length,
+          total: list.length,
+          list,
           ...(result.warnings && result.warnings.length
             ? { warnings: result.warnings }
             : {}),
@@ -1834,6 +1997,82 @@ async function handleMedia(url, pool) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* 按需播放解析                                                                */
+/* -------------------------------------------------------------------------- */
+
+async function handlePlay(url, pool, env) {
+  const id = String(url.searchParams.get("id") || "").trim();
+  const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
+  const slug = String(url.searchParams.get("up") || "").trim();
+
+  if (!id) return jsonResponse({ code: 0, msg: "缺少 id", list: [] }, 400);
+
+  const upstream = upstreamBySlug(pool, slug);
+  if (!upstream) {
+    return jsonResponse(
+      { code: 0, msg: `未知上游: ${slug || "(空)"}`, list: [] },
+      404
+    );
+  }
+
+  try {
+    let target = "";
+
+    if (upstream.kind === "huangguo") {
+      target = await resolveNativePlay(upstream, id, ep, env);
+    } else {
+      const detail = await maccmsDetail(upstream, id, url.origin, env);
+      if (detail.status === "ok") {
+        const parts = String(detail.vod.vod_play_url || "").split("#");
+        const index = Math.max(0, (Number(ep) || 1) - 1);
+        const selected = parts[index] || parts[0] || "";
+        target = selected.includes("$")
+          ? selected.split("$").slice(1).join("$")
+          : selected;
+      }
+    }
+
+    if (!isHttpUrl(target)) {
+      return jsonResponse(
+        {
+          code: 0,
+          msg: "上游没有返回可播放地址",
+          kind: "no_playable",
+          upstream: upstream.slug,
+          list: [],
+        },
+        502
+      );
+    }
+
+    return new Response(null, {
+      status: 302,
+      headers: {
+        ...CORS,
+        Location: target,
+        "Cache-Control": "no-store",
+      },
+    });
+  } catch (error) {
+    const err =
+      error instanceof UpstreamError
+        ? error
+        : new UpstreamError(upstream, "upstream", String(error && error.message));
+    return jsonResponse(
+      {
+        code: 0,
+        msg: errorMessage(err),
+        kind: err.kind,
+        upstream: err.upstream,
+        detail: err.toJSON(),
+        list: [],
+      },
+      502
+    );
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* 入口                                                                        */
 /* -------------------------------------------------------------------------- */
 
@@ -1854,11 +2093,20 @@ export async function onRequest(context) {
   const mediaPath = url.pathname.replace(/\/+$/, "");
   const isMedia =
     mediaPath === "/huangguo/media" || mediaPath.endsWith("/huangguo/media");
+  const isPlay =
+    mediaPath === "/huangguo/play" ||
+    mediaPath === "/huangguo/play.m3u8" ||
+    mediaPath.endsWith("/huangguo/play") ||
+    mediaPath.endsWith("/huangguo/play.m3u8");
 
   // 诊断端点首次访问时等待一次池刷新，保证能立即看到全部候选上游。
   const pool = await getPool(env, context, {
-    awaitRefresh: ac === "upstreams" && !isMedia,
+    awaitRefresh: ac === "upstreams" && !isMedia && !isPlay,
   });
+
+  if (isPlay) {
+    return handlePlay(url, pool, env);
+  }
 
   if (isMedia) {
     return handleMedia(url, pool);

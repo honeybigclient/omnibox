@@ -135,14 +135,12 @@ export default function SourceHome() {
   );
 
   useEffect(() => {
-    const available = buildSources();
-    setSources(available);
-
-    try {
-      const saved = localStorage.getItem(HOME_SOURCE_KEY);
-      if (saved === DOUBAN_KEY || available.some((site) => site.key === saved)) {
-        setCurrentKey(saved!);
-      } else {
+    const chooseInitial = (available: ApiSite[]): string => {
+      try {
+        const saved = localStorage.getItem(HOME_SOURCE_KEY);
+        if (saved === DOUBAN_KEY || available.some((site) => site.key === saved)) {
+          return saved!;
+        }
         const selected = (() => {
           try {
             const parsed = JSON.parse(localStorage.getItem("selectedApiSites") || "[]");
@@ -154,11 +152,28 @@ export default function SourceHome() {
         const preferred =
           available.find((site) => site.key === "huangguo") ||
           available.find((site) => selected.includes(site.key));
-        setCurrentKey(preferred ? preferred.key : DOUBAN_KEY);
+        return preferred ? preferred.key : DOUBAN_KEY;
+      } catch {
+        return DOUBAN_KEY;
       }
-    } catch {
-      // ignore
-    }
+    };
+
+    const applySources = () => {
+      const available = buildSources();
+      setSources(available);
+      setCurrentKey((previous) =>
+        previous !== DOUBAN_KEY && available.some((site) => site.key === previous)
+          ? previous
+          : chooseInitial(available)
+      );
+    };
+
+    applySources();
+    // index.html 异步同步上游源列表后会发这个事件，已挂载的页面无需刷新。
+    window.addEventListener("huangguo-upstreams-updated", applySources);
+    return () => {
+      window.removeEventListener("huangguo-upstreams-updated", applySources);
+    };
   }, []);
 
   useEffect(() => {

@@ -86,6 +86,52 @@ const nativeDetail = {
   ],
 };
 
+// 详情里的剧集是网页地址，适配层应生成 /huangguo/play 惰性地址。
+const nativeLazyDetail = {
+  list: [
+    {
+      vod_id: 12600,
+      vod_name: "惰性解析测试",
+      vod_pic: "https://img.test/cover.jpg",
+      vod_remarks: "全2集",
+      type_name: "AI短剧",
+      episodes: [
+        { ep: 1, title: "第1集", url: "https://site.test/video/12600/ep-1/" },
+        { ep: 2, title: "第2集", url: "https://site.test/video/12600/ep-2/" },
+      ],
+    },
+  ],
+};
+
+// Worker /api/play 返回空时，应回退到源站页面里的 videoInitialData。
+const nativePageFallbackDetail = {
+  list: [
+    {
+      vod_id: 12700,
+      vod_name: "页面兜底测试",
+      vod_pic: "https://img.test/cover.jpg",
+      vod_remarks: "全2集",
+      type_name: "AI短剧",
+      episodes: [
+        { ep: 1, title: "第1集", url: "https://site.test/video/12700/" },
+        { ep: 2, title: "第2集", url: "https://site.test/video/12700/ep-2/" },
+      ],
+    },
+  ],
+};
+
+// 详情存在但 episodes 为空：应明确报 no_playable，而不是“没有找到内容”。
+const nativeEmptyDetail = {
+  list: [
+    {
+      vod_id: 99999,
+      vod_name: "空剧集测试",
+      vod_pic: "https://img.test/cover.jpg",
+      episodes: [],
+    },
+  ],
+};
+
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -142,11 +188,32 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response("origin down", { status: 522 });
   }
 
+  if (parsed.hostname === "site.test") {
+    if (parsed.pathname === "/video/12700/ep-2/") {
+      return new Response(
+        '<script id="videoInitialData">{"epPlaySrcs":{"2":"https:\\/\\/cdn.test\\/from-page.m3u8"}}</script>',
+        { status: 200, headers: { "Content-Type": "text/html" } }
+      );
+    }
+    if (parsed.pathname.startsWith("/api/videos/")) {
+      return json({ data: { video_url: "" } });
+    }
+    return new Response("not found", { status: 404 });
+  }
+
   if (parsed.hostname === "native.test") {
     if (parsed.pathname.startsWith("/api/category/")) return json(nativeList);
     if (parsed.pathname.startsWith("/api/search/")) return json(nativeSearch);
     if (parsed.pathname === "/api/detail/12527") return json(nativeDetail);
-    if (parsed.pathname === "/api/play") return json({ url: "https://cdn.test/play.m3u8" });
+    if (parsed.pathname === "/api/detail/12600") return json(nativeLazyDetail);
+    if (parsed.pathname === "/api/detail/12700") return json(nativePageFallbackDetail);
+    if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
+    if (parsed.pathname === "/api/play") {
+      if (parsed.searchParams.get("url") === "12700") {
+        return json({ url: "", proxy: "" });
+      }
+      return json({ url: "https://cdn.test/play.m3u8" });
+    }
     return new Response("not found", { status: 404 });
   }
 
@@ -368,6 +435,40 @@ async function main() {
   await show("6. ac=detail&ids=huangguo-web~12527（命名空间）", path, result);
   expect(result.body.list[0].vod_id === "huangguo-web~12527", "namespaced detail id");
 
+  // 6b. 详情里的网页剧集地址应转成 /huangguo/play 惰性地址，不在详情阶段解析。
+  path = "/huangguo/api.php/provide/vod/?ac=detail&ids=12600";
+  result = await call(path);
+  await show("6b. 网页剧集地址转惰性播放地址", path, result);
+  const lazyUrl = result.body.list[0].vod_play_url.split("#")[0].split("$")[1];
+  expect(lazyUrl.includes("/huangguo/play.m3u8?"), "lazy play url");
+  expect(result.body.list[0].vod_play_url.split("#").length === 2, "two lazy episodes");
+
+  // 6c. 点播时才请求上游 /api/play，并 302 到真实流。
+  const lazyPath = new URL(lazyUrl).pathname + new URL(lazyUrl).search;
+  result = await call(lazyPath);
+  await show("6c. /huangguo/play 302 到真实流", lazyPath, result);
+  console.log(`Location: ${result.response.headers.get("location")}`);
+  expect(result.status === 302, "play 302");
+  expect(
+    result.response.headers.get("location") === "https://cdn.test/play.m3u8",
+    "play location"
+  );
+
+  // 6d. Worker /api/play 返回空时，回退到详情页 videoInitialData。
+  path = "/huangguo/api.php/provide/vod/?ac=detail&ids=12700";
+  result = await call(path);
+  await show("6d. Worker play 为空时回退页面", path, result);
+  const fallbackLazy = result.body.list[0].vod_play_url.split("#")[1].split("$")[1];
+  const fallbackPath = new URL(fallbackLazy).pathname + new URL(fallbackLazy).search;
+  result = await call(fallbackPath);
+  await show("6e. 页面兜底 302 到真实流", fallbackPath, result);
+  console.log(`Location: ${result.response.headers.get("location")}`);
+  expect(result.status === 302, "page fallback 302");
+  expect(
+    result.response.headers.get("location") === "https://cdn.test/from-page.m3u8",
+    "page fallback location"
+  );
+
   // 7. MacCMS 上游按 slug 路由 + ac=list。
   path = "/huangguo/api.php/provide/vod/?ac=list&slug=alpha";
   result = await call(path);
@@ -402,6 +503,9 @@ async function main() {
     result.body.list.every((item) => item.vod_id.includes("~")),
     "all search ids namespaced"
   );
+  expect(result.body.list[0].source_key === "huangguo", "native source key");
+  expect(result.body.list[1].source_key === "hg_alpha", "alpha source key");
+  expect(result.body.list[1].source_name === "Alpha 资源", "alpha source name");
 
   // 11. 确实没有内容：code 1 + 没有找到内容。
   path = "/huangguo/api.php/provide/vod/?ac=detail&ids=alpha~9999";
@@ -409,6 +513,15 @@ async function main() {
   await show("11. ac=detail&ids=alpha~9999（真实未找到）", path, result);
   expect(result.body.code === 1, "not found code 1");
   expect(result.body.msg === "没有找到内容", "not found msg");
+
+  // 11b. 详情存在但 episodes 为空：明确 no_playable，并带诊断信息。
+  path = "/huangguo/api.php/provide/vod/?ac=detail&ids=99999";
+  result = await call(path);
+  await show("11b. 详情存在但 episodes 为空", path, result);
+  expect(result.body.code === 0, "empty episodes code 0");
+  expect(result.body.error.kind === "no_playable", "empty episodes kind");
+  expect(result.body.error.details.episodes === 0, "empty episodes details");
+  expect(result.body.msg.includes("episodes 为空"), "empty episodes concrete msg");
 
   // 12. 图片代理保持可用。
   path = "/huangguo/media?src=https%3A%2F%2Fimg.test%2Fcover.jpg&up=huangguo-web";

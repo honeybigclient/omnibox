@@ -472,8 +472,14 @@ export default function SearchResultsPage() {
       const customSites = JSON.parse(
         localStorage.getItem("customApiSites") || "[]"
       ) as ApiSite[];
+      // hg_* 是 /huangguo 下的子源，默认 huangguo 源一次请求就会合并搜索，
+      // 不要再让浏览器为每个子源单独发一次请求。
       const allowedCustomSites = customSites.filter(
-        (site) => site?.key && site?.api && isAllowedSource(site.key)
+        (site) =>
+          site?.key &&
+          site?.api &&
+          isAllowedSource(site.key) &&
+          !String(site.key).startsWith("hg_")
       );
 
       const seen = new Set<string>();
@@ -501,8 +507,8 @@ export default function SearchResultsPage() {
               id: item.vod_id,
               title: item.vod_name,
               poster: item.vod_pic,
-              source: site.name,
-              source_key: site.key,
+              source: item.source_name || item.source || site.name,
+              source_key: item.source_key || site.key,
               vod_remarks: item.vod_remarks,
               type: item.type_name || "未知",
               year: item.vod_year || "未知",

@@ -166,8 +166,18 @@ function PlayerPage() {
         const customSites: ApiSite[] = JSON.parse(localStorage.getItem("customApiSites") || "[]");
         const allSites = [...defaultSites, ...customSites];
 
-        // 查找对应的站点 API
-        const foundSite = allSites.find((site) => site.key === sourceKey);
+        // 查找对应的站点 API。hg_* 是服务端适配层的子源，
+        // 即使当前 localStorage 还没同步到，也能按 slug 拼出 /huangguo/<slug>。
+        const foundSite =
+          allSites.find((site) => site.key === sourceKey) ||
+          (sourceKey.startsWith("hg_")
+            ? {
+                key: sourceKey,
+                name: sourceKey,
+                api: `${window.location.origin}/huangguo/${sourceKey.slice(3)}`,
+                isCustom: true,
+              }
+            : undefined);
 
         if (!foundSite) {
           throw new Error(`未找到源: ${sourceKey}`);
