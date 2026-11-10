@@ -357,10 +357,34 @@ function PlayerPage() {
     }
   }, [currentSource, movieDetails, episodes]);
 
+  // 换集时不该重建播放器（重建会丢全屏和倍速），只有剧/源/集列表/跳过设置变了才重建。
+  const playerIdentity = `${vodId}|${sourceKey || ""}|${sortedEpisodes.length}|${skipStart}|${skipEnd}`;
+  const playerIdentityRef = useRef(playerIdentity);
+  const needRecreateRef = useRef(true);
+  const fullscreenTimerRef = useRef<number | null>(null);
+  if (playerIdentityRef.current !== playerIdentity) {
+    playerIdentityRef.current = playerIdentity;
+    needRecreateRef.current = true;
+  }
+
   useEffect(() => {
     if (currentSource && artRef.current) {
-      if (playerRef.current) {
-        playerRef.current.destroy();
+      const existing = playerRef.current;
+      if (existing && !needRecreateRef.current) {
+        // 只是换了同一部剧的另一集：就地换源，播放器、全屏状态、倍速全都保留。
+        needRecreateRef.current = false;
+        if (existing.url !== currentSource) {
+          void existing.switchUrl(currentSource);
+        }
+        return;
+      }
+      needRecreateRef.current = false;
+      if (fullscreenTimerRef.current !== null) {
+        window.clearInterval(fullscreenTimerRef.current);
+        fullscreenTimerRef.current = null;
+      }
+      if (existing) {
+        existing.destroy();
       }
 
       const currentEpisodeNumber = sortedEpisodes.find((ep) => ep.url === currentSource)?.number;
@@ -915,7 +939,7 @@ function PlayerPage() {
 
       // 网页 CSS 全屏时通知安卓壳：这样竖屏全屏也有返回键和手势（且不吞掉网页点击）。
       let lastCssFullscreen = false;
-      const fullscreenTimer = window.setInterval(() => {
+      fullscreenTimerRef.current = window.setInterval(() => {
         const cssFullscreen = !!art.fullscreenWeb;
         if (cssFullscreen === lastCssFullscreen) return;
         lastCssFullscreen = cssFullscreen;
@@ -926,21 +950,37 @@ function PlayerPage() {
         }
       }, 400);
 
-      return () => {
-        window.clearInterval(fullscreenTimer);
+
+    }
+  }, [currentSource, vodId, sortedEpisodes, sourceKey, skipStart, skipEnd]);
+
+  // 只有页面卸载时才销毁播放器；换集走 switchUrl，保留全屏/倍速。
+  useEffect(
+    () => () => {
+      if (fullscreenTimerRef.current !== null) {
+        window.clearInterval(fullscreenTimerRef.current);
+        fullscreenTimerRef.current = null;
+      }
+      try {
+        (
+          window as unknown as { OmniboxNative?: { setFullscreen?: (v: boolean) => void } }
+        ).OmniboxNative?.setFullscreen?.(false);
+      } catch {
+        // 忽略
+      }
+      const holder = window as unknown as { OmniboxPlayer?: unknown };
+      delete holder.OmniboxPlayer;
+      if (playerRef.current) {
         try {
-          nativeBridge?.setFullscreen?.(false);
+          playerRef.current.destroy();
         } catch {
           // 忽略
         }
-        const holder = window as unknown as { OmniboxPlayer?: unknown };
-        if (holder.OmniboxPlayer === playerBridge) delete holder.OmniboxPlayer;
-        if (art) {
-          art.destroy();
-        }
-      };
-    }
-  }, [currentSource, vodId, sortedEpisodes, sourceKey, skipStart, skipEnd]);
+        playerRef.current = null;
+      }
+    },
+    []
+  );
 
   // --- Event Handlers ---
   const toggleSortOrder = () => {
