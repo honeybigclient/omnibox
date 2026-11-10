@@ -11,6 +11,7 @@
  *   /huangguo/hls?src=...&ref=...                      (播放代理：m3u8 改写 +
  *                                                       key/分片透传，兜住 CORS)
  *   /huangguo/m3u8?src=...                             (同 hls，保留旧链接)
+ *   /huangguo/api.php/provide/vod/?ac=playdebug         (播放解析诊断)
  *
  * 播放入口 /huangguo/play.m3u8 不再 302 裸地址，而是 302 到 /huangguo/hls，
  * 由 Worker 代理取流；这是修复"一直转圈"的关键。解析失败时会按健康度
@@ -1115,6 +1116,62 @@ function isDirectMediaUrl(value) {
   );
 }
 
+/**
+ * 上游接口字段名一直在变（url / play_url / video_url / data.url / 甚至塞在
+ * JSON 字符串里），这里做一次有界的深度搜索，避免"明明有地址却解析不到"。
+ */
+function deepFindMediaUrl(value, depth = 0) {
+  if (depth > 4 || value == null) return "";
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) return "";
+    if (isDirectMediaUrl(text)) return text;
+    if (/^[[{]/.test(text)) {
+      try {
+        return deepFindMediaUrl(JSON.parse(text), depth + 1);
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = deepFindMediaUrl(item, depth + 1);
+      if (found) return found;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    const preferred = [
+      "url",
+      "proxy",
+      "play_url",
+      "playUrl",
+      "video_url",
+      "videoUrl",
+      "m3u8",
+      "m3u8_url",
+      "src",
+      "file",
+      "link",
+      "data",
+      "result",
+    ];
+    for (const key of preferred) {
+      if (key in value) {
+        const found = deepFindMediaUrl(value[key], depth + 1);
+        if (found) return found;
+      }
+    }
+    for (const item of Object.values(value)) {
+      const found = deepFindMediaUrl(item, depth + 1);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
 async function mapLimit(items, limit, mapper) {
   const results = new Array(items.length);
   let next = 0;
@@ -1257,6 +1314,23 @@ async function fetchPageStream(upstream, pageUrl, ep, timeoutMs) {
       /https?:\/\/[^"'<>\s]+?\.(?:m3u8|mp4)(?:\?[^"'<>\s]*)?/i
     );
     if (matched) return matched[0].replace(/&amp;/g, "&");
+
+    // 再宽一点：player_aaaa / player_data 之类的配置块、<source src>、data-src。
+    const configMatch = normalized.match(
+      /(?:player_[a-z0-9]*|playerData|videoInfo)\s*=\s*(\{[\s\S]{0,4000}?\})\s*[;<]/i
+    );
+    if (configMatch) {
+      const fromConfig = deepFindMediaUrl(configMatch[1]);
+      if (fromConfig) return fromConfig;
+    }
+
+    const attrMatch = normalized.match(
+      /<(?:source|video)[^>]+(?:src|data-src|data-video-src)=["']([^"']+)["']/i
+    );
+    if (attrMatch) {
+      const candidate = attrMatch[1].replace(/&amp;/g, "&");
+      if (isDirectMediaUrl(candidate)) return candidate;
+    }
   } catch {
     // 页面抓取失败就返回空，由调用方决定下一个兜底。
   }
@@ -1427,12 +1501,21 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
       attempts.push({ step: "worker-play", ok: true, via: "proxy", status, ms });
       return { url: proxy, attempts };
     }
+    // 字段名变了也要认出来（data.url / play_url / 嵌套 JSON 字符串等）。
+    const deepWorker = deepFindMediaUrl(data);
+    if (deepWorker) {
+      attempts.push({ step: "worker-play", ok: true, via: "deep", status, ms });
+      return { url: deepWorker, attempts };
+    }
     attempts.push({
       step: "worker-play",
       ok: false,
       status,
       ms,
       reason: "empty url/proxy",
+      ...(data && typeof data === "object"
+        ? { keys: Object.keys(data).slice(0, 8) }
+        : {}),
     });
   } catch (error) {
     attempts.push({ step: "worker-play", ok: false, ...playAttemptError(error) });
@@ -1450,10 +1533,17 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
     const siteUrl = String(
       (data.data && data.data.video_url) || data.video_url || ""
     ).trim();
+    const deepSite = siteUrl ? "" : deepFindMediaUrl(data);
     const ms = Date.now() - started;
-    if (isHttpUrl(siteUrl)) {
-      attempts.push({ step: "site-play", ok: true, status, ms });
-      return { url: siteUrl, attempts };
+    if (isHttpUrl(siteUrl) || deepSite) {
+      attempts.push({
+        step: "site-play",
+        ok: true,
+        status,
+        ms,
+        ...(deepSite ? { via: "deep" } : {}),
+      });
+      return { url: siteUrl || deepSite, attempts };
     }
     attempts.push({
       step: "site-play",
@@ -1461,6 +1551,9 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
       status,
       ms,
       reason: "empty video_url",
+      ...(data && typeof data === "object"
+        ? { keys: Object.keys(data).slice(0, 8) }
+        : {}),
     });
   } catch (error) {
     attempts.push({ step: "site-play", ok: false, ...playAttemptError(error) });
@@ -2258,9 +2351,11 @@ async function resolveHuangguoMeByTitle(title, ep, env) {
 
   const detailLinks = Array.from(
     new Set(
-      Array.from(searchText.matchAll(/href="(\/detail\/[^"]+)"/g)).map(
-        (match) => match[1]
-      )
+      Array.from(
+        searchText.matchAll(
+          /href=["'](?:https?:\/\/huangguo\.me)?(\/detail\/[^"']+)["']/g
+        )
+      ).map((match) => match[1])
     )
   ).slice(0, 6);
 
@@ -3019,6 +3114,139 @@ async function handlePlay(url, pool, env) {
   );
 }
 
+/**
+ * 播放诊断：把解析每一步的上游原始返回打出来（含 HTTP 状态、耗时、JSON 键名、
+ * 抓到的媒体地址、正文前 1200 字符）。排查"上游有片却解析不到"时用它。
+ *
+ *   /huangguo/api.php/provide/vod/?ac=playdebug&up=huangguo-web&id=12527&ep=1
+ *   &page=https%3A%2F%2Fhuangguoai.com%2Fvideo%2F12527%2Fep-1%2F&title=剧名
+ */
+async function handlePlayDebug(url, pool, env) {
+  const id = String(url.searchParams.get("id") || "").trim();
+  const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
+  const slug = String(url.searchParams.get("up") || "").trim();
+  const pageHint = String(url.searchParams.get("page") || "").trim();
+  const title = String(url.searchParams.get("title") || "").trim();
+
+  const upstream = upstreamBySlug(pool, slug);
+  if (!upstream) {
+    return jsonResponse(
+      { code: 0, msg: `未知上游: ${slug || "(空)"}` },
+      404
+    );
+  }
+  if (!id) {
+    return jsonResponse({ code: 0, msg: "缺少 id" }, 400);
+  }
+
+  const steps = [];
+  const baseHeaders = {
+    "User-Agent": UA,
+    Referer: refererOf(upstream),
+    Accept: "application/json, text/plain, */*",
+  };
+
+  const probe = async (label, target, init = {}) => {
+    const started = Date.now();
+    try {
+      const response = await fetchWithTimeout(
+        target,
+        { ...init, headers: { ...baseHeaders, ...(init.headers || {}) } },
+        12000
+      );
+      const text = await response.text();
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+      const snippet =
+        parsed && typeof parsed === "object"
+          ? JSON.stringify(parsed).slice(0, 1200)
+          : text.slice(0, 1200);
+      steps.push({
+        step: label,
+        target,
+        status: response.status,
+        ms: Date.now() - started,
+        contentType: response.headers.get("content-type") || "",
+        keys:
+          parsed && typeof parsed === "object"
+            ? Object.keys(parsed).slice(0, 12)
+            : null,
+        foundMedia: deepFindMediaUrl(parsed || text),
+        body: snippet,
+      });
+    } catch (error) {
+      steps.push({
+        step: label,
+        target,
+        ms: Date.now() - started,
+        error: String((error && error.message) || error).slice(0, 200),
+      });
+    }
+  };
+
+  const pageUrl = isHttpUrl(pageHint)
+    ? pageHint
+    : `${upstream.site}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`;
+
+  if (upstream.kind === "huangguo") {
+    await probe(
+      "worker-play-page",
+      `${upstream.api}/api/play?url=${encodeURIComponent(pageUrl)}&ep=${encodeURIComponent(ep)}`
+    );
+    await probe(
+      "worker-play-id",
+      `${upstream.api}/api/play?url=${encodeURIComponent(id)}&ep=${encodeURIComponent(ep)}`
+    );
+    await probe(
+      "site-play",
+      `${upstream.site}/api/videos/${encodeURIComponent(id)}/play?ep=${encodeURIComponent(ep)}`
+    );
+    await probe("page", pageUrl);
+    await probe(
+      "worker-detail",
+      `${upstream.api}/api/detail/${encodeURIComponent(id)}`
+    );
+  }
+
+  if (title) {
+    await probe(
+      "huangguo-me-search",
+      `${HUANGGUO_ME}/search/?q=${encodeURIComponent(title)}`
+    );
+  }
+
+  let resolved = { url: "", attempts: [] };
+  try {
+    resolved =
+      upstream.kind === "huangguo"
+        ? await resolveNativePlay(upstream, id, ep, env, pageHint, 12000)
+        : { url: "", attempts: [] };
+  } catch (error) {
+    resolved = { url: "", attempts: [playAttemptError(error)] };
+  }
+
+  return jsonResponse({
+    code: 1,
+    msg: "播放诊断",
+    upstream: {
+      slug: upstream.slug,
+      kind: upstream.kind,
+      api: upstream.api,
+      site: upstream.site,
+    },
+    id,
+    ep,
+    title,
+    pageUrl,
+    resolved,
+    steps,
+  });
+}
+
 /* -------------------------------------------------------------------------- */
 /* 入口                                                                        */
 /* -------------------------------------------------------------------------- */
@@ -3064,6 +3292,10 @@ export async function onRequest(context) {
   const pool = await getPool(env, context, {
     awaitRefresh: ac === "upstreams" && !isMedia && !isPlay && !isM3u8,
   });
+
+  if (ac === "playdebug") {
+    return handlePlayDebug(url, pool, env);
+  }
 
   if (isPlay) {
     return handlePlay(url, pool, env);
