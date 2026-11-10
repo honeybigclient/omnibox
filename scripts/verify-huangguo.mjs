@@ -172,6 +172,18 @@ const nativeDeepDetail = {
   ],
 };
 
+// 刚更新、上游还没生成播放地址：应报 media_pending，而不是笼统的 no_playable。
+const nativePendingDetail = {
+  list: [
+    {
+      vod_id: 13200,
+      vod_name: "待转码测试",
+      vod_pic: "https://img.test/cover.jpg",
+      episodes: [{ ep: 1, title: "第1集", url: "https://site.test/video/13200/ep-1/" }],
+    },
+  ],
+};
+
 // 详情存在但 episodes 为空：应明确报 no_playable，而不是“没有找到内容”。
 const nativeEmptyDetail = {
   list: [
@@ -311,6 +323,10 @@ globalThis.fetch = async (input, init = {}) => {
       );
     }
     if (parsed.pathname.startsWith("/api/videos/")) {
+      // 13200 模拟"有 duration、没有 video_url"的新更新剧集。
+      if (parsed.pathname.includes("13200")) {
+        return json({ data: { duration: 360, video_url: "" } });
+      }
       return json({ data: { video_url: "" } });
     }
     return new Response("not found", { status: 404 });
@@ -326,10 +342,16 @@ globalThis.fetch = async (input, init = {}) => {
     if (parsed.pathname === "/api/detail/12900") return json(nativeWorkerPageBugDetail);
     if (parsed.pathname === "/api/detail/13000") return json(nativeFailoverDetail);
     if (parsed.pathname === "/api/detail/13100") return json(nativeDeepDetail);
+    if (parsed.pathname === "/api/detail/13200") return json(nativePendingDetail);
     if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
     if (parsed.pathname === "/api/play") {
       const target = String(parsed.searchParams.get("url") || "");
-      if (target.includes("12700") || target.includes("12800") || target.includes("13000")) {
+      if (
+        target.includes("12700") ||
+        target.includes("12800") ||
+        target.includes("13000") ||
+        target.includes("13200")
+      ) {
         return json({ url: "", proxy: "" });
       }
       // 模拟字段改名：地址藏在 data.play_url 里。
@@ -597,9 +619,17 @@ async function main() {
   await show("6c. /huangguo/play 302 到真实流", lazyPath, result);
   console.log(`Location: ${result.response.headers.get("location")}`);
   expect(result.status === 302, "play 302");
+  // 浏览器直连优先：CDN 对住宅 IP 才给完整片源（Worker 出口只有预览片段）。
+  expect(
+    result.response.headers.get("location") === "https://cdn.test/play.m3u8",
+    "play location direct"
+  );
+
+  // 直连失败时前端带 proxy=1 重试，走本域代理。
+  result = await call(lazyPath + "&proxy=1");
   expect(
     proxiedSrc(result) === "https://cdn.test/play.m3u8",
-    "play location proxied"
+    "play location proxied when proxy=1"
   );
 
   // 6d. Worker /api/play 返回空时，回退到详情页 videoInitialData。
@@ -613,8 +643,8 @@ async function main() {
   console.log(`Location: ${result.response.headers.get("location")}`);
   expect(result.status === 302, "page fallback 302");
   expect(
-    proxiedSrc(result) === "https://cdn.test/from-page.m3u8",
-    "page fallback location proxied"
+    result.response.headers.get("location") === "https://cdn.test/from-page.m3u8",
+    "page fallback location direct"
   );
 
   // 6f. 所有兜底都失败时，502 JSON 必须带 attempts。
@@ -652,8 +682,8 @@ async function main() {
   console.log(`Location: ${result.response.headers.get("location")}`);
   expect(result.status === 302, "worker page bug 302");
   expect(
-    proxiedSrc(result) === "https://cdn.test/from-page-12900.m3u8",
-    "worker page bug location proxied"
+    result.response.headers.get("location") === "https://cdn.test/from-page-12900.m3u8",
+    "worker page bug location direct"
   );
 
   // 6j. 旧惰性 URL 没有 page 时，v3 会自动回详情取 page，仍然能播。
@@ -663,8 +693,8 @@ async function main() {
   console.log(`Location: ${result.response.headers.get("location")}`);
   expect(result.status === 302, "legacy lazy 302");
   expect(
-    proxiedSrc(result) === "https://cdn.test/from-page-12900.m3u8",
-    "legacy lazy location proxied"
+    result.response.headers.get("location") === "https://cdn.test/from-page-12900.m3u8",
+    "legacy lazy location direct"
   );
 
   // 6k. 播放代理：m3u8 改写 + key/分片按 CORS 能力直连或代理。
@@ -732,7 +762,7 @@ async function main() {
   await show("6n. 嵌套字段里的播放地址", path, result);
   expect(result.status === 302, "deep url 302");
   expect(
-    proxiedSrc(result) === "https://cdn.test/deep.m3u8",
+    result.response.headers.get("location") === "https://cdn.test/deep.m3u8",
     "deep url extracted"
   );
 
@@ -763,6 +793,45 @@ async function main() {
     result.body.steps.some((item) => item.label === "baseline"),
     "playprobe baseline"
   );
+
+  // 6q. 刚更新的剧集：上游有 duration 没地址，报 media_pending 并给出人话提示。
+  path =
+    "/huangguo/play.m3u8?up=huangguo-web&id=13200&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/13200/ep-1/");
+  result = await call(path);
+  await show("6q. 刚更新无片源", path, result);
+  expect(result.status === 502, "pending 502");
+  expect(result.body.kind === "media_pending", "pending kind");
+  expect(result.body.msg.includes("还没生成播放地址"), "pending msg");
+
+  // 6r. 命名空间 id（slug~id）漏进播放参数时也要能用。
+  path = "/huangguo/api.php/provide/vod/?ac=playdebug&up=huangguo-web&id=huangguo-web~13100&ep=1";
+  result = await call(path);
+  await show("6r. playdebug 容忍命名空间 id", path, result);
+  expect(result.body.id === "13100", "playdebug strips namespace");
+  expect(
+    result.body.resolved.url === "https://cdn.test/deep.m3u8",
+    "playdebug resolves after stripping"
+  );
+
+  path =
+    "/huangguo/play.m3u8?up=huangguo-web&id=huangguo-web~13100&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/huangguo-web~13100/ep-1/");
+  result = await call(path);
+  await show("6s. 播放容忍命名空间 id", path, result);
+  expect(result.status === 302, "play with namespaced id 302");
+  expect(
+    result.response.headers.get("location") === "https://cdn.test/deep.m3u8",
+    "play strips namespace"
+  );
+
+  // 6t. 批量片源自检。
+  path = "/huangguo/api.php/provide/vod/?ac=playcheck&up=huangguo-web&ids=huangguo-web~13100";
+  result = await call(path);
+  await show("6t. 批量片源自检", path, result);
+  expect(result.body.code === 1, "playcheck code");
+  expect(result.body.rows.length === 1 && result.body.rows[0].id === "13100", "playcheck rows");
+  expect(result.body.rows[0].ok === false, "playcheck detects empty media");
 
   // 7. MacCMS 上游按 slug 路由 + ac=list。
   path = "/huangguo/api.php/provide/vod/?ac=list&slug=alpha";

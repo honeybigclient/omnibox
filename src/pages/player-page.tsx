@@ -524,48 +524,32 @@ function PlayerPage() {
         ],
         customType: {
           m3u8: function playM3u8(video, url, art) {
+            const userProxy = localStorage.getItem("m3u8ProxySelected");
+            const applyUserProxy = (target: string) =>
+              userProxy ? `${userProxy}${target}` : target;
+            // 浏览器直连 CDN 拿完整片源（CDN 按出口 IP 给不同列表），
+            // 直连被拒时给同一个地址加 proxy=1，让适配层改走 Worker 代理。
+            const toProxyRetry = (target: string) => {
+              const base = target.replace(/([?&])proxy=1(&|$)/g, "$1").replace(/[?&]$/, "");
+              return `${base}${base.includes("?") ? "&" : "?"}proxy=1`;
+            };
+
             if (Hls.isSupported()) {
-              if (art.hls) (art.hls as Hls).destroy();
-              const hls = new Hls({
-                manifestLoadingTimeOut: 15000,
-                manifestLoadingMaxRetry: 2,
-                levelLoadingTimeOut: 15000,
-                fragLoadingTimeOut: 20000,
-                fragLoadingMaxRetry: 2,
-              });
-              const proxyUrl = localStorage.getItem("m3u8ProxySelected");
-              const finalUrl = proxyUrl ? `${proxyUrl}${url}` : url;
+              let current: Hls | null = null;
+              let watchdog = 0;
+              let proxyRetried = false;
 
-              let recovered = false;
-              let lastTime = 0;
-              let lastProgressAt = Date.now();
-              // 分片卡住时 hls.js 往往不报错，只是无限转圈；这里自己看进度。
-              const watchdog = window.setInterval(() => {
-                if (video.paused || video.ended) {
-                  lastProgressAt = Date.now();
-                  return;
-                }
-                if (video.currentTime !== lastTime) {
-                  lastTime = video.currentTime;
-                  lastProgressAt = Date.now();
-                  return;
-                }
-                if (Date.now() - lastProgressAt > 20000) {
+              const stopWatchdog = () => {
+                if (watchdog) {
                   window.clearInterval(watchdog);
-                  failoverRef.current("stall");
+                  watchdog = 0;
                 }
-              }, 5000);
+              };
 
-              hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                lastProgressAt = Date.now();
-              });
-
-              // 清单拉不下来时，适配层通常返回的是 502 JSON，把里面的 msg 读出来，
-              // 这样用户看到的是"该剧暂无片源"而不是干巴巴的 manifestLoadError。
-              const readManifestError = async () => {
+              const readManifestError = async (target: string) => {
                 try {
                   const response = await Promise.race([
-                    fetch(finalUrl, { cache: "no-store" }),
+                    fetch(target, { cache: "no-store" }),
                     new Promise<never>((_, reject) =>
                       setTimeout(() => reject(new Error("timeout")), 3000)
                     ),
@@ -581,45 +565,105 @@ function PlayerPage() {
                 return "无法加载播放列表";
               };
 
-              hls.on(Hls.Events.ERROR, (_event, data) => {
-                if (!data.fatal) return;
-                // 解码类错误先原地恢复一次，还不行再切源。
-                if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
-                  recovered = true;
+              const mount = (target: string) => {
+                stopWatchdog();
+                if (current) {
                   try {
-                    hls.recoverMediaError();
-                    return;
+                    current.destroy();
                   } catch {
-                    // 恢复失败，继续切源。
+                    // 已经销毁过。
                   }
                 }
-                window.clearInterval(watchdog);
-                try {
-                  hls.destroy();
-                } catch {
-                  // 已经销毁过。
-                }
-                const fallback = `${data.type}/${data.details}`;
-                if (String(data.details || "").includes("manifest")) {
-                  void readManifestError().then((reason) =>
-                    failoverRef.current(reason || fallback)
-                  );
-                } else {
-                  failoverRef.current(fallback);
-                }
-              });
 
-              hls.loadSource(finalUrl);
-              hls.attachMedia(video);
-              art.hls = hls;
+                const hls = new Hls({
+                  manifestLoadingTimeOut: 15000,
+                  manifestLoadingMaxRetry: 2,
+                  levelLoadingTimeOut: 15000,
+                  fragLoadingTimeOut: 20000,
+                  fragLoadingMaxRetry: 2,
+                });
+                current = hls;
+                art.hls = hls;
+
+                let recovered = false;
+                let lastTime = 0;
+                let lastProgressAt = Date.now();
+                // 分片卡住时 hls.js 往往不报错，只是无限转圈；这里自己看进度。
+                watchdog = window.setInterval(() => {
+                  if (video.paused || video.ended) {
+                    lastProgressAt = Date.now();
+                    return;
+                  }
+                  if (video.currentTime !== lastTime) {
+                    lastTime = video.currentTime;
+                    lastProgressAt = Date.now();
+                    return;
+                  }
+                  if (Date.now() - lastProgressAt > 20000) {
+                    stopWatchdog();
+                    failoverRef.current("播放卡住");
+                  }
+                }, 5000);
+
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                  lastProgressAt = Date.now();
+                });
+
+                hls.on(Hls.Events.ERROR, (_event, data) => {
+                  if (!data.fatal) return;
+                  // 解码类错误先原地恢复一次，还不行再切源。
+                  if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
+                    recovered = true;
+                    try {
+                      hls.recoverMediaError();
+                      return;
+                    } catch {
+                      // 恢复失败，继续往下走。
+                    }
+                  }
+
+                  const isManifest = String(data.details || "").includes("manifest");
+                  if (isManifest && !proxyRetried) {
+                    // 直连拿不到清单（被拒/跨域）→ 同一源改走代理再试一次。
+                    proxyRetried = true;
+                    art.notice.show = "直连失败，改走代理重试…";
+                    mount(toProxyRetry(target));
+                    return;
+                  }
+
+                  stopWatchdog();
+                  try {
+                    hls.destroy();
+                  } catch {
+                    // 已经销毁过。
+                  }
+                  const fallback = `${data.type}/${data.details}`;
+                  if (isManifest) {
+                    void readManifestError(applyUserProxy(target)).then((reason) =>
+                      failoverRef.current(reason || fallback)
+                    );
+                  } else {
+                    failoverRef.current(fallback);
+                  }
+                });
+
+                hls.loadSource(applyUserProxy(target));
+                hls.attachMedia(video);
+              };
+
+              mount(url);
               art.on("destroy", () => {
-                window.clearInterval(watchdog);
-                hls.destroy();
+                stopWatchdog();
+                if (current) {
+                  try {
+                    current.destroy();
+                  } catch {
+                    // 已经销毁过。
+                  }
+                }
               });
             } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
-              const proxyUrl = localStorage.getItem("m3u8ProxySelected");
-              const finalUrl = proxyUrl ? `${proxyUrl}${url}` : url;
-              video.src = finalUrl;
+              video.src = applyUserProxy(url);
               video.addEventListener("error", () =>
                 failoverRef.current("native-hls")
               );

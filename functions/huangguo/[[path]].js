@@ -1425,7 +1425,8 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
           status,
           ms: Date.now() - started,
         });
-        return { url, attempts };
+        // 原生站 CDN 对分片和清单都带 CORS，浏览器直连才能拿到完整片源。
+        return { url, attempts, preferDirect: true };
       }
       if (isHttpUrl(url)) detailPageUrl = url;
       attempts.push({
@@ -1464,7 +1465,7 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
           status,
           ms: Date.now() - started,
         });
-        return { url, attempts };
+        return { url, attempts, preferDirect: true };
       }
       attempts.push({
         step: "archives-post",
@@ -1490,7 +1491,7 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
       ms: Date.now() - started,
       ...(archivePage ? {} : { reason: "no media" }),
     });
-    if (archivePage) return { url: archivePage, attempts };
+    if (archivePage) return { url: archivePage, attempts, preferDirect: true };
   }
 
   // Worker /api/play：优先传真实剧集页地址，让 Worker 的页面兜底可用。
@@ -1512,17 +1513,26 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
       !(direct.startsWith("http://") && proxy.startsWith("https://"))
     ) {
       attempts.push({ step: "worker-play", ok: true, via: "direct", status, ms });
-      return { url: direct, attempts };
+      return {
+        url: direct,
+        attempts,
+        // preferDirect=true 表示浏览器直连能拿到完整片源（Worker 出口只有预览片段）
+        preferDirect: data.preferDirect !== false,
+      };
     }
     if (isHttpUrl(proxy)) {
       attempts.push({ step: "worker-play", ok: true, via: "proxy", status, ms });
-      return { url: proxy, attempts };
+      return { url: proxy, attempts, preferDirect: true };
     }
     // 字段名变了也要认出来（data.url / play_url / 嵌套 JSON 字符串等）。
     const deepWorker = deepFindMediaUrl(data);
     if (deepWorker) {
       attempts.push({ step: "worker-play", ok: true, via: "deep", status, ms });
-      return { url: deepWorker, attempts };
+      return {
+        url: deepWorker,
+        attempts,
+        preferDirect: data.preferDirect !== false,
+      };
     }
     const declared = Number((data && data.declaredDuration) || 0);
     attempts.push({
@@ -1568,7 +1578,7 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
         ms,
         ...(deepSite ? { via: "deep" } : {}),
       });
-      return { url: siteUrl || deepSite, attempts };
+      return { url: siteUrl || deepSite, attempts, preferDirect: true };
     }
     const detailData = (data && data.data) || null;
     const duration = Number((detailData && detailData.duration) || 0);
@@ -1608,7 +1618,11 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
     ...(pageStream ? {} : { reason: "no media" }),
   });
 
-  return { url: pageStream || "", attempts };
+  return {
+    url: pageStream || "",
+    attempts,
+    preferDirect: true,
+  };
 }
 
 async function nativeDetail(upstream, id, origin, env) {
@@ -2936,7 +2950,13 @@ async function maccmsPlayByTitle(upstream, title, ep, env) {
     episodes: parts.length,
   });
 
-  return { url, referer: refererOf(upstream), attempts };
+  return {
+    url,
+    referer: refererOf(upstream),
+    // 其他 MacCMS 站的 CORS 情况未知，默认走代理更稳。
+    preferDirect: false,
+    attempts,
+  };
 }
 
 async function resolveCandidatePlay(candidate, ctx) {
@@ -2955,6 +2975,7 @@ async function resolveCandidatePlay(candidate, ctx) {
       return {
         url: native.url,
         referer: refererOf(candidate),
+        preferDirect: native.preferDirect !== false,
         attempts: native.attempts,
       };
     }
@@ -2972,6 +2993,8 @@ async function resolveCandidatePlay(candidate, ctx) {
         return {
           url: me.stream,
           referer: me.playPage || `${HUANGGUO_ME}/`,
+          // 新站 m3u8 没有 CORS 头，必须走代理。
+          preferDirect: false,
           attempts,
         };
       }
@@ -2992,6 +3015,7 @@ async function resolveCandidatePlay(candidate, ctx) {
     return {
       url: me.stream,
       referer: me.playPage || `${HUANGGUO_ME}/`,
+      preferDirect: false,
       attempts: me.attempts,
     };
   }
@@ -3070,20 +3094,28 @@ async function handlePlay(url, pool, env) {
       attempts.push(...result.attempts);
 
       if (isHttpUrl(result.url)) {
-        // 一律经由本域代理，把 CORS / Referer / Range 问题收进 Worker 里，
-        // 不再把裸 m3u8 直接丢给 hls.js（那是无限转圈的根源）。
-        const proxy = streamProxyUrl(url.origin, result.url, result.referer);
+        // 黄果 CDN 按出口 IP 给不同版本：浏览器（住宅 IP）能拿到完整片源，
+        // Worker（机房 IP）只给 54s 预览。所以默认让浏览器直连，代理只做兜底：
+        //   - 直连失败 → 前端带 proxy=1 重试，走 /huangguo/hls
+        //   - 新站（huangguo.me）清单没有 CORS → preferDirect=false，直接代理
+        const wantProxy =
+          /^(1|true|yes)$/i.test(String(url.searchParams.get("proxy") || "")) ||
+          result.preferDirect === false;
+        const location = wantProxy
+          ? streamProxyUrl(url.origin, result.url, result.referer)
+          : result.url;
         attempts.push({
-          step: `${candidate.slug}-proxy`,
+          step: `${candidate.slug}-route`,
           ok: true,
           upstream: candidate.slug,
+          route: wantProxy ? "proxy" : "direct",
           ms: Date.now() - started,
         });
         return new Response(null, {
           status: 302,
           headers: {
             ...CORS,
-            Location: proxy,
+            Location: location,
             "Cache-Control": "no-store",
           },
         });
