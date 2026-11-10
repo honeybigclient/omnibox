@@ -1363,6 +1363,22 @@ async function fetchPageStream(upstream, pageUrl, ep, timeoutMs) {
  * no_playable。详情阶段改为生成 /huangguo/play.m3u8?... 的惰性地址，
  * 点哪集解析哪集；解析顺序：Worker /api/play → 源站官方接口 → 页面兜底。
  */
+/** 手动拼的播放链接常常没带 title，这里按 id 补一次剧名，新站兜底才用得上。 */
+async function lookupTitle(upstream, id, env) {
+  try {
+    const { data } = await requestUpstreamJson(
+      upstream,
+      `${upstream.api}/api/detail/${encodeURIComponent(id)}`,
+      env,
+      { timeoutMs: 5000 }
+    );
+    const item = (Array.isArray(data.list) && data.list[0]) || null;
+    return item ? String(item.vod_name || "").trim() : "";
+  } catch {
+    return "";
+  }
+}
+
 /**
  * 有些剧集要先访问一次剧集页拿到会话 cookie，接口才肯给播放地址
  * （老剧尤其明显）。这里先抓一次页面、留下 set-cookie，再带 cookie 请求接口。
@@ -3093,7 +3109,7 @@ async function handlePlay(url, pool, env) {
     pool,
     String(url.searchParams.get("page") || "").trim()
   );
-  const title = String(url.searchParams.get("title") || "").trim();
+  let title = String(url.searchParams.get("title") || "").trim();
 
   if (!id) return jsonResponse({ code: 0, msg: "缺少 id", list: [] }, 400);
 
@@ -3103,6 +3119,11 @@ async function handlePlay(url, pool, env) {
       { code: 0, msg: `未知上游: ${slug || "(空)"}`, list: [] },
       404
     );
+  }
+
+  // 手拼链接、历史记录里常常没有 title，补一次剧名才能走新站兜底。
+  if (!title && upstream.kind === "huangguo") {
+    title = await lookupTitle(upstream, id, env);
   }
 
   const allowCross = /^(1|true|yes)$/i.test(
@@ -3605,6 +3626,11 @@ async function handlePlayDebug(url, pool, env) {
     }
   };
 
+  let debugTitle = title;
+  if (!debugTitle && upstream.kind === "huangguo") {
+    debugTitle = await lookupTitle(upstream, id, env);
+  }
+
   const pageUrl = isHttpUrl(pageHint)
     ? pageHint
     : `${upstream.site}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`;
@@ -3629,10 +3655,10 @@ async function handlePlayDebug(url, pool, env) {
     );
   }
 
-  if (title) {
+  if (debugTitle) {
     await probe(
       "huangguo-me-search",
-      `${HUANGGUO_ME}/search/?q=${encodeURIComponent(title)}`
+      `${HUANGGUO_ME}/search/?q=${encodeURIComponent(debugTitle)}`
     );
   }
 
@@ -3657,7 +3683,7 @@ async function handlePlayDebug(url, pool, env) {
     },
     id,
     ep,
-    title,
+    title: debugTitle || title,
     pageUrl,
     resolved,
     steps,
