@@ -663,8 +663,13 @@ async function main() {
     "worker attempt visible"
   );
   expect(
-    Array.isArray(result.body.tried) && result.body.tried.includes("alpha"),
-    "failover candidates tried"
+    Array.isArray(result.body.tried) && result.body.tried.includes("huangguo-web"),
+    "tried includes requested upstream"
+  );
+  // 默认不跨站：黄果源里绝不能冒出其他上游的片子。
+  expect(
+    !result.body.tried.some((slug) => slug === "alpha" || slug === "beta"),
+    "no cross-source failover by default"
   );
 
   // 6h. 真实 Worker 缺陷模拟：详情页地址必须出现在惰性 URL 里。
@@ -734,25 +739,37 @@ async function main() {
   );
 
   // 6l. 旧站彻底失败时，按剧名自动切到有同名剧的上游。
+  // 6l. 默认不跨站：同一部剧在 alpha 有，但黄果源里不该出现。
   path =
     "/huangguo/play.m3u8?up=huangguo-web&id=13000&ep=1&page=" +
     encodeURIComponent("https://site.test/video/13000/ep-1/") +
     "&title=" +
     encodeURIComponent("测试短剧 Alpha");
   result = await call(path);
-  await show("6l. 上游失败自动切到 alpha", path, result);
-  expect(result.status === 302, "failover 302");
+  await show("6l. 默认不跨站兜底", path, result);
+  expect(result.status === 502, "no cross-source by default");
+  expect(result.body.kind === "no_playable", "no cross kind");
+
+  // 6l2. 显式 cross=1 才允许跨站兜底。
+  result = await call(path + "&cross=1");
+  await show("6l2. cross=1 才跨站兜底", path + "&cross=1", result);
+  expect(result.status === 302, "cross failover 302");
   expect(
     proxiedSrc(result) === "https://alpha.test/1.m3u8",
-    "failover to alpha play url"
+    "cross failover to alpha play url"
   );
 
   // 6m. 详情响应附带候选上游，供前端切源使用。
   path = "/huangguo/api.php/provide/vod/?ac=detail&ids=13000";
   result = await call(path);
   const candidates = result.body.list[0].upstream_candidates;
-  expect(Array.isArray(candidates) && candidates.length >= 2, "detail candidates");
+  expect(Array.isArray(candidates) && candidates.length >= 1, "detail candidates");
   expect(candidates[0].slug === "huangguo-web", "candidate prefers requested upstream");
+  // 候选也只能是黄果这一家，不能把别的站塞进黄果源的切源列表。
+  expect(
+    candidates.every((item) => item.kind === "huangguo" || item.kind === "huangguo-me"),
+    "candidates stay in the huangguo family"
+  );
 
   // 6n. 上游字段改名（data.play_url）时，深度搜索要能捞出来。
   path =

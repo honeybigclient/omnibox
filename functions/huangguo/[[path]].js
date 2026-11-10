@@ -2202,7 +2202,7 @@ async function handleDetail(url, pool, env) {
     }
 
     // 附带一份候选上游（按健康度/延迟排序），前端切源时可以直接用。
-    const candidates = rankedUpstreams(pool, upstream).map((item) => ({
+    const candidates = playCandidates(pool, upstream, false).map((item) => ({
       slug: item.slug,
       name: item.name,
       kind: item.kind,
@@ -2889,6 +2889,34 @@ function rankedUpstreams(pool, preferred) {
   return [preferred, ...rest.slice(0, 3)];
 }
 
+/**
+ * 同一个"源"的边界：黄果原生站和黄果新站算一家，可以互相兜底；
+ * 其他 MacCMS 站各算各的，绝不跨站顶替——否则黄果源里会播出别家的片子。
+ */
+function familyOf(upstream) {
+  return upstream.kind === "huangguo" || upstream.kind === "huangguo-me"
+    ? "huangguo"
+    : upstream.slug;
+}
+
+function playCandidates(pool, preferred, allowCross) {
+  if (!pool || !pool.upstreams.length) return preferred ? [preferred] : [];
+  if (!preferred) return pool.upstreams.slice(0, 1);
+  // 显式 ?cross=1 时才允许跨站兜底（默认关闭）。
+  if (allowCross) return rankedUpstreams(pool, preferred);
+
+  const family = familyOf(preferred);
+  const siblings = pool.upstreams
+    .filter(
+      (item) => item.slug !== preferred.slug && familyOf(item) === family
+    )
+    .map((upstream) => ({ upstream, score: healthScore(upstream) }))
+    .sort((a, b) => b.score - a.score)
+    .map((entry) => entry.upstream);
+
+  return [preferred, ...siblings.slice(0, 2)];
+}
+
 function pickTitleMatch(items, title) {
   let best = null;
   let bestScore = -1;
@@ -3057,7 +3085,10 @@ async function handlePlay(url, pool, env) {
     );
   }
 
-  const candidates = rankedUpstreams(pool, upstream);
+  const allowCross = /^(1|true|yes)$/i.test(
+    String(url.searchParams.get("cross") || "")
+  );
+  const candidates = playCandidates(pool, upstream, allowCross);
   const deadline = Date.now() + 18000;
   const attempts = [];
   let lastError = null;
