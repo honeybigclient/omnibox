@@ -6,7 +6,9 @@
  *   /huangguo/api.php/provide/vod/?ac=videolist&wd=...
  *   /huangguo/api.php/provide/vod/?ac=detail&ids=...
  *   /huangguo/api.php/provide/vod/?ac=upstreams       (诊断)
+ *   /huangguo/api.php/provide/vod/?ac=huangguome      (新站播放诊断)
  *   /huangguo/media?src=...                            (图片代理)
+ *   /huangguo/m3u8?src=...                             (新站播放列表代理)
  *
  * 上游池由三部分组成：
  *   1. 黄果 spider 里的 API / SITE（原生 Worker JSON 接口）；
@@ -30,6 +32,19 @@
 
 const DEFAULT_API = "https://huangguo-parser.13681235735.workers.dev";
 const DEFAULT_SITE = "https://huangguoai.com";
+// 黄果新站（iodefog/HuangGuoVideo-Download 使用的路线）：
+// /detail/{slug}/ -> /play/{slug}/{chapterId}/ ->
+// /api/playlet/chapter/detail?chapterId=&playletSlug= -> data.videoUrl -> /h5/m3u8/{videoUrl}
+const HUANGGUO_ME = "https://huangguo.me";
+const HUANGGUO_ME_UPSTREAM = {
+  key: "huangguo_me",
+  slug: "huangguo-me",
+  name: "黄果短剧(新)",
+  kind: "huangguo-me",
+  source: "builtin",
+  api: HUANGGUO_ME,
+  site: HUANGGUO_ME,
+};
 const SPIDER_JS_URL =
   "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/huangguo_web_spider.js";
 const SOURCES_JSON_URL =
@@ -163,15 +178,17 @@ function namespaceId(upstream, id) {
   return raw.startsWith(prefix) ? raw : `${prefix}${raw}`;
 }
 
-function lazyPlayUrl(origin, upstream, id, ep, pageUrl) {
+function lazyPlayUrl(origin, upstream, id, ep, pageUrl, title) {
   // 结尾必须是 .m3u8，Artplayer 靠扩展名选择 customType.m3u8 / Hls.js。
   // page 是详情里这一集的真实页面地址；Worker 的页面兜底需要它。
+  // title 用于旧站播放失败后按剧名去 huangguo.me 找新站片源。
   const params = new URLSearchParams({
     up: upstream.slug,
     id: String(id),
     ep: String(ep),
   });
   if (isHttpUrl(pageUrl)) params.set("page", pageUrl);
+  if (title) params.set("title", String(title));
   return `${origin}/huangguo/play.m3u8?${params.toString()}`;
 }
 
@@ -1493,7 +1510,14 @@ async function nativeDetail(upstream, id, origin, env) {
     if (url.startsWith("//")) url = `https:${url}`;
     const pageUrl = isHttpUrl(url) ? url : "";
     if (!isDirectMediaUrl(url)) {
-      url = lazyPlayUrl(origin, upstream, id, epNumber, pageUrl);
+      url = lazyPlayUrl(
+        origin,
+        upstream,
+        id,
+        epNumber,
+        pageUrl,
+        item.vod_name || ""
+      );
     }
     return `${title}$${url}`;
   });
@@ -2118,11 +2142,406 @@ async function handleMedia(url, pool) {
 /* 按需播放解析                                                                */
 /* -------------------------------------------------------------------------- */
 
+function stripHtmlText(value) {
+  return String(value || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeTitleKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[\s\p{P}\p{S}]/gu, "");
+}
+
+function titleScore(wanted, candidate) {
+  const a = normalizeTitleKey(wanted);
+  const b = normalizeTitleKey(candidate);
+  if (!a || !b) return -1;
+  if (a === b) return 100;
+  if (b.includes(a) || a.includes(b)) return 80;
+  const chars = new Set(Array.from(a));
+  let hit = 0;
+  for (const ch of chars) {
+    if (b.includes(ch)) hit += 1;
+  }
+  return Math.round((hit / chars.size) * 60);
+}
+
+async function fetchHuangguoMeText(url, referer, timeoutMs) {
+  const response = await fetchWithTimeout(
+    url,
+    {
+      headers: {
+        "User-Agent": UA,
+        Referer: referer || `${HUANGGUO_ME}/`,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+      },
+    },
+    timeoutMs
+  );
+  if (!response.ok) {
+    throw new UpstreamError(
+      HUANGGUO_ME_UPSTREAM,
+      "http",
+      `HTTP ${response.status}`,
+      { status: response.status, ms: 0 }
+    );
+  }
+  return { text: await response.text(), status: response.status };
+}
+
+/**
+ * 旧站播放失败后的新站兜底（路线来自 iodefog/HuangGuoVideo-Download）：
+ * 按剧名搜索 huangguo.me -> 详情页取 /play/{slug}/{chapterId}/ ->
+ * /api/playlet/chapter/detail -> data.videoUrl -> /h5/m3u8/{videoUrl}
+ */
+async function resolveHuangguoMeByTitle(title, ep, env) {
+  const attempts = [];
+  const startedAll = Date.now();
+  const timeout = Math.min(upstreamTimeout(env), 8000);
+
+  if (!title) {
+    attempts.push({ step: "huangguo-me", ok: false, reason: "缺少剧名" });
+    return { stream: "", playPage: "", title: "", attempts };
+  }
+
+  let searchText = "";
+  try {
+    const started = Date.now();
+    const search = await fetchHuangguoMeText(
+      `${HUANGGUO_ME}/search/?q=${encodeURIComponent(title)}`,
+      `${HUANGGUO_ME}/`,
+      timeout
+    );
+    searchText = search.text;
+    attempts.push({
+      step: "huangguo-me-search",
+      ok: true,
+      status: search.status,
+      ms: Date.now() - started,
+    });
+  } catch (error) {
+    attempts.push({
+      step: "huangguo-me-search",
+      ok: false,
+      ...playAttemptError(error),
+    });
+    return { stream: "", playPage: "", title: "", attempts };
+  }
+
+  const detailLinks = Array.from(
+    new Set(
+      Array.from(searchText.matchAll(/href="(\/detail\/[^"]+)"/g)).map(
+        (match) => match[1]
+      )
+    )
+  ).slice(0, 6);
+
+  if (!detailLinks.length) {
+    attempts.push({ step: "huangguo-me-search", ok: false, reason: "没有搜索结果" });
+    return { stream: "", playPage: "", title: "", attempts };
+  }
+
+  const candidates = await mapLimit(detailLinks, 4, async (link) => {
+    try {
+      const page = await fetchHuangguoMeText(
+        `${HUANGGUO_ME}${link}`,
+        `${HUANGGUO_ME}/`,
+        timeout
+      );
+      const titleHtml =
+        (page.text.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] ||
+        (page.text.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) || [])[1] ||
+        "";
+      const rawTitle = stripHtmlText(titleHtml)
+        .replace(/\s*[-–—|]\s*黄果短剧[\s\S]*$/i, "")
+        .trim();
+      const plays = Array.from(
+        new Set(
+          Array.from(page.text.matchAll(/href="(\/play\/[^"]+)"/g)).map(
+            (match) => match[1]
+          )
+        )
+      ).filter((path) => /\/play\/[^/]+\/\d+\/?$/.test(path));
+      return {
+        link,
+        rawTitle,
+        plays,
+        score: titleScore(title, rawTitle),
+      };
+    } catch (error) {
+      return {
+        link,
+        rawTitle: "",
+        plays: [],
+        score: -1,
+        error: playAttemptError(error),
+      };
+    }
+  });
+
+  // 先排除详情页没有分集链接的条目（有些是预告/空壳），再按标题相似度排。
+  candidates.sort(
+    (a, b) =>
+      (b.plays.length > 0 ? 1 : 0) - (a.plays.length > 0 ? 1 : 0) ||
+      b.score - a.score ||
+      b.plays.length - a.plays.length
+  );
+  const usable = candidates.filter(
+    (item) => item.score >= 50 && item.plays.length > 0
+  );
+  attempts.push({
+    step: "huangguo-me-detail",
+    ok: usable.length > 0,
+    candidates: candidates.slice(0, 6).map((item) => ({
+      title: item.rawTitle,
+      score: item.score,
+      plays: item.plays.length,
+      error: item.error,
+    })),
+  });
+
+  const best = usable[0];
+  if (!best) {
+    return {
+      stream: "",
+      playPage: "",
+      title: candidates[0] ? candidates[0].rawTitle : "",
+      attempts,
+    };
+  }
+
+  const epIndex = Math.min(
+    Math.max(0, (Number(ep) || 1) - 1),
+    best.plays.length - 1
+  );
+  const playPath = best.plays[epIndex] || best.plays[0];
+  const chapterId = playPath.split("/").filter(Boolean).pop();
+  const slug = best.link.split("/").filter(Boolean).pop();
+  const playPage = `${HUANGGUO_ME}${playPath}`;
+
+  try {
+    const started = Date.now();
+    const { data, status } = await requestUpstreamJson(
+      HUANGGUO_ME_UPSTREAM,
+      `${HUANGGUO_ME}/api/playlet/chapter/detail?chapterId=${encodeURIComponent(
+        chapterId
+      )}&playletSlug=${encodeURIComponent(slug)}`,
+      env,
+      { timeoutMs: timeout }
+    );
+    const detail = (data && data.data) || {};
+    const raw = String(detail.videoUrl || "").trim();
+
+    if (detail.needUnlock && !detail.canWatch) {
+      attempts.push({
+        step: "huangguo-me-api",
+        ok: false,
+        status,
+        ms: Date.now() - started,
+        reason: "locked",
+      });
+      return { stream: "", playPage, title: best.rawTitle, attempts };
+    }
+
+    if (!raw) {
+      attempts.push({
+        step: "huangguo-me-api",
+        ok: false,
+        status,
+        ms: Date.now() - started,
+        reason: "empty videoUrl",
+      });
+      return { stream: "", playPage, title: best.rawTitle, attempts };
+    }
+
+    const stream = /^https?:\/\//i.test(raw)
+      ? raw
+      : `${HUANGGUO_ME}/h5/m3u8/${raw.replace(/^\/+/, "")}`;
+    attempts.push({
+      step: "huangguo-me-api",
+      ok: true,
+      status,
+      ms: Date.now() - started,
+      title: detail.title || best.rawTitle,
+      episode: detail.currentEpisode,
+      totalMs: Date.now() - startedAll,
+    });
+    return { stream, playPage, title: best.rawTitle, attempts };
+  } catch (error) {
+    attempts.push({
+      step: "huangguo-me-api",
+      ok: false,
+      ...playAttemptError(error),
+    });
+    return { stream: "", playPage, title: best.rawTitle, attempts };
+  }
+}
+
+function isAllowedHuangguoMeHost(hostname) {
+  return (
+    hostname === "huangguo.me" ||
+    hostname.endsWith(".huangguo.me") ||
+    hostname === "rlkfus.cn" ||
+    hostname.endsWith(".rlkfus.cn")
+  );
+}
+
+/**
+ * huangguo.me 的 m3u8 本身没有 CORS 头，不能直接交给浏览器 Hls.js；
+ * 这里只代理播放列表，并把 key/variant URI 改成绝对地址。
+ * 分片域名（webats.rlkfus.cn）实测带 Access-Control-Allow-Origin: *，继续直连。
+ */
+async function handleM3u8(url) {
+  const src = url.searchParams.get("src") || "";
+  const ref = url.searchParams.get("ref") || `${HUANGGUO_ME}/`;
+
+  if (!isHttpUrl(src)) {
+    return jsonResponse({ error: "缺少有效的 m3u8 地址" }, 400);
+  }
+
+  let srcUrl;
+  try {
+    srcUrl = new URL(src);
+  } catch {
+    return jsonResponse({ error: "m3u8 地址无效" }, 400);
+  }
+  if (!isAllowedHuangguoMeHost(srcUrl.hostname)) {
+    return jsonResponse({ error: "不允许的 m3u8 域名" }, 400);
+  }
+
+  let referer = `${HUANGGUO_ME}/`;
+  try {
+    const refUrl = new URL(ref);
+    if (isAllowedHuangguoMeHost(refUrl.hostname)) referer = refUrl.toString();
+  } catch {
+    // 使用默认 Referer。
+  }
+
+  let response;
+  try {
+    response = await fetchWithTimeout(
+      src,
+      {
+        headers: {
+          "User-Agent": UA,
+          Referer: referer,
+          Accept: "application/vnd.apple.mpegurl,application/x-mpegURL,*/*",
+        },
+      },
+      15000
+    );
+  } catch (error) {
+    return jsonResponse(
+      { error: "m3u8 拉取失败", message: error && error.message },
+      502
+    );
+  }
+
+  if (!response.ok) {
+    return jsonResponse(
+      { error: `上游 m3u8 返回 HTTP ${response.status}` },
+      502
+    );
+  }
+
+  const text = await response.text();
+  if (!text.trimStart().startsWith("#EXTM3U")) {
+    return jsonResponse({ error: "上游返回的不是 m3u8" }, 502);
+  }
+
+  const absolutize = (value) => {
+    try {
+      return new URL(value, src).toString();
+    } catch {
+      return value;
+    }
+  };
+  const proxyUrl = (value) =>
+    `${url.origin}/huangguo/m3u8?src=${encodeURIComponent(
+      value
+    )}&ref=${encodeURIComponent(referer)}`;
+
+  const rewritten = text
+    .split(/\r?\n/)
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+      if (trimmed.startsWith("#")) {
+        return line.replace(/URI="([^"]+)"/g, (match, uri) => {
+          const abs = absolutize(uri);
+          return `URI="${
+            /\.m3u8(\?|#|$)/i.test(abs) ? proxyUrl(abs) : abs
+          }"`;
+        });
+      }
+      const abs = absolutize(trimmed);
+      if (/\.m3u8(\?|#|$)/i.test(abs)) return proxyUrl(abs);
+      return abs;
+    })
+    .join("\n");
+
+  return new Response(rewritten, {
+    headers: {
+      ...CORS,
+      "Content-Type": "application/vnd.apple.mpegurl; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+async function handleHuangguoMe(url, env) {
+  const title = String(
+    url.searchParams.get("wd") ||
+      url.searchParams.get("title") ||
+      ""
+  ).trim();
+  const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
+
+  if (!title) {
+    return jsonResponse({ code: 0, msg: "缺少 wd/title", list: [] }, 400);
+  }
+
+  const result = await resolveHuangguoMeByTitle(title, ep, env);
+  if (!result.stream) {
+    return jsonResponse({
+      code: 0,
+      msg: "新站没有找到可播放地址",
+      title: result.title || title,
+      attempts: result.attempts,
+      list: [],
+    });
+  }
+
+  return jsonResponse({
+    code: 1,
+    msg: "ok",
+    title: result.title || title,
+    stream: result.stream,
+    playPage: result.playPage,
+    proxy: `${url.origin}/huangguo/m3u8?src=${encodeURIComponent(
+      result.stream
+    )}&ref=${encodeURIComponent(result.playPage || `${HUANGGUO_ME}/`)}`,
+    attempts: result.attempts,
+    list: [],
+  });
+}
+
 async function handlePlay(url, pool, env) {
   const id = String(url.searchParams.get("id") || "").trim();
   const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
   const slug = String(url.searchParams.get("up") || "").trim();
   const pageHint = String(url.searchParams.get("page") || "").trim();
+  const title = String(url.searchParams.get("title") || "").trim();
 
   if (!id) return jsonResponse({ code: 0, msg: "缺少 id", list: [] }, 400);
 
@@ -2133,6 +2552,25 @@ async function handlePlay(url, pool, env) {
       404
     );
   }
+
+  // 旧站先解析；800ms 后还没结果再并行启动新站兜底。
+  // 旧站很快成功时不会白白请求 huangguo.me；旧站慢时新站已经准备好。
+  let mePromise = null;
+  const startMe = () => {
+    if (!mePromise && upstream.kind === "huangguo" && title) {
+      mePromise = resolveHuangguoMeByTitle(title, ep, env).catch((error) => ({
+        stream: "",
+        playPage: "",
+        title: "",
+        attempts: [
+          { step: "huangguo-me", ok: false, ...playAttemptError(error) },
+        ],
+      }));
+    }
+    return mePromise;
+  };
+  const meTimer =
+    upstream.kind === "huangguo" && title ? setTimeout(startMe, 800) : null;
 
   let attempts = [];
   try {
@@ -2151,6 +2589,30 @@ async function handlePlay(url, pool, env) {
         target = selected.includes("$")
           ? selected.split("$").slice(1).join("$")
           : selected;
+      }
+    }
+
+    // 旧站三层兜底都失败后，按剧名去 huangguo.me 新站找同一部剧。
+    if (!isHttpUrl(target) && upstream.kind === "huangguo") {
+      if (startMe()) {
+        const me = await startMe();
+        attempts.push(...me.attempts);
+        if (isHttpUrl(me.stream)) {
+          target = `${url.origin}/huangguo/m3u8?src=${encodeURIComponent(
+            me.stream
+          )}&ref=${encodeURIComponent(me.playPage || `${HUANGGUO_ME}/`)}`;
+          attempts.push({
+            step: "huangguo-me-proxy",
+            ok: true,
+            playPage: me.playPage,
+          });
+        }
+      } else {
+        attempts.push({
+          step: "huangguo-me",
+          ok: false,
+          reason: "旧播放地址没有 title 参数，无法用新站兜底",
+        });
       }
     }
 
@@ -2193,6 +2655,8 @@ async function handlePlay(url, pool, env) {
       },
       502
     );
+  } finally {
+    if (meTimer) clearTimeout(meTimer);
   }
 }
 
@@ -2222,10 +2686,21 @@ export async function onRequest(context) {
     mediaPath === "/huangguo/play.m3u8" ||
     mediaPath.endsWith("/huangguo/play") ||
     mediaPath.endsWith("/huangguo/play.m3u8");
+  const isM3u8 =
+    mediaPath === "/huangguo/m3u8" || mediaPath.endsWith("/huangguo/m3u8");
+
+  // 新站 m3u8 代理和诊断不需要上游池。
+  if (isM3u8) {
+    return handleM3u8(url);
+  }
+
+  if (ac === "huangguome") {
+    return handleHuangguoMe(url, env);
+  }
 
   // 诊断端点首次访问时等待一次池刷新，保证能立即看到全部候选上游。
   const pool = await getPool(env, context, {
-    awaitRefresh: ac === "upstreams" && !isMedia && !isPlay,
+    awaitRefresh: ac === "upstreams" && !isMedia && !isPlay && !isM3u8,
   });
 
   if (isPlay) {
