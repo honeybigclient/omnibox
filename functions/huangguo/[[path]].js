@@ -57,6 +57,19 @@ const HUANGGUO_ME_UPSTREAM = {
 // 官方跳转页把镜像清单写在 publish.js 里（子域 × 域名 随机拼线路），
 // 主站被墙或握手失败时可以自动换线。
 const PUBLISH_JS_URL = "https://huangguoai.pages.dev/publish.js";
+// publish.js 拉不到时的兜底线路（实测这三条响应最快、接口与本家一致）。
+const DEFAULT_MIRRORS = [
+  "https://thu.adihsppe.cc",
+  "https://pku.adihsppe.cc",
+  "https://fdu.adihsppe.cc",
+];
+// 额外公共采集站清单：和 spider 自带的 all_sources_config.json 取并集，
+// 按域名去重，这样别人更新了清单我们也能自动跟上。
+const EXTRA_CONFIG_URLS = [
+  "https://cdn.jsdelivr.net/gh/fangkuia/XPTV@main/all.json",
+  "https://raw.githubusercontent.com/fangkuia/XPTV/main/all.json",
+  "https://cdn.jsdelivr.net/gh/qianxi-00/kazumi-extra-rules@main/kazumi-extra-rules.json",
+];
 const SPIDER_JS_URL =
   "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/huangguo_web_spider.js";
 const SOURCES_JSON_URL =
@@ -83,7 +96,7 @@ const DEFAULT_SEARCH_DEADLINE_MS = 9000;
 const DEFAULT_PROBE_TIMEOUT_MS = 4000;
 const DEFAULT_PROBE_DEADLINE_MS = 9000;
 
-const POOL_CACHE_URL = "https://huangguo.internal/__upstreams_v1";
+const POOL_CACHE_URL = "https://huangguo.internal/__upstreams_v2";
 const BOOTSTRAP_TTL_MS = 30 * 1000;
 
 const HUANGGUO_CLASSES = [
@@ -529,16 +542,19 @@ function hydratePool(raw) {
   for (const item of list) {
     if (!item || !item.slug || !item.kind) continue;
     const slug = uniqueSlug(slugify(item.slug), used);
-    if (item.kind === "huangguo") {
-      if (!item.api || !item.site) continue;
+    if (item.kind === "huangguo" || item.kind === "huangguo-site") {
+      // 镜像站（huangguo-site）只需要 site，不依赖那个 Worker。
+      if (!item.site) continue;
+      if (item.kind === "huangguo" && !item.api) continue;
       upstreams.push({
         key: String(item.key || slug),
         slug,
         name: String(item.name || "黄果短剧"),
-        kind: "huangguo",
+        kind: item.kind === "huangguo-site" ? "huangguo-site" : "huangguo",
         source: String(item.source || "cache"),
-        api: normalizeBase(item.api),
+        api: item.api ? normalizeBase(item.api) : "",
         site: normalizeBase(item.site),
+        mirrors: Array.isArray(item.mirrors) ? item.mirrors : [],
         searchable: item.searchable !== false,
       });
     } else {
@@ -771,11 +787,20 @@ async function refreshPool(env) {
 
   poolState.loading = (async () => {
     const previous = poolState.pool || (await cacheGetPool());
-    const [spiderResult, sourcesResult, publishResult] = await Promise.allSettled([
-      fetchText(SPIDER_JS_URL, 8000),
-      fetchText(SOURCES_JSON_URL, 10000),
-      fetchText(PUBLISH_JS_URL, 6000),
-    ]);
+    // 额外公共清单默认不并入：这里只做黄果自己的源，其他站的资源不是目标。
+    // 想要时用环境变量 HUANGGUO_EXTRA_SOURCES=1 打开。
+    const wantExtras =
+      String((env && env.HUANGGUO_EXTRA_SOURCES) || "0") === "1";
+
+    const [spiderResult, sourcesResult, publishResult, ...extraResults] =
+      await Promise.allSettled([
+        fetchText(SPIDER_JS_URL, 9000),
+        fetchText(SOURCES_JSON_URL, 11000),
+        fetchText(PUBLISH_JS_URL, 8000),
+        ...(wantExtras
+          ? EXTRA_CONFIG_URLS.map((url) => fetchText(url, 6000))
+          : []),
+      ]);
 
     let native = nativeUpstream(DEFAULT_API, DEFAULT_SITE, "builtin");
     if (spiderResult.status === "fulfilled") {
@@ -792,7 +817,8 @@ async function refreshPool(env) {
         : previous
           ? parseMirrorsFromPrevious(previous)
           : [];
-    native.mirrors = [...new Set([...envMirrors(env), ...parsedMirrors])].filter(
+    const baseMirrors = parsedMirrors.length ? parsedMirrors : DEFAULT_MIRRORS;
+    native.mirrors = [...new Set([...envMirrors(env), ...baseMirrors])].filter(
       (item) => hostOfUrl(item) !== hostOfUrl(native.site)
     );
 
@@ -813,11 +839,40 @@ async function refreshPool(env) {
       console.warn("读取 all_sources_config.json 失败，沿用缓存中的 MacCMS 上游");
     }
 
+    // 合并额外清单里没见过的采集站（按域名去重）。
+    const seenHosts = new Set(
+      [native, ...configUpstreams].map((item) => hostOfUrl(item.site || item.endpoint))
+    );
+    const extraUpstreams = [];
+    for (const result of extraResults) {
+      if (!result || result.status !== "fulfilled") continue;
+      const parsed = parseConfigUpstreams(result.value);
+      if (!parsed) continue;
+      for (const item of parsed) {
+        const host = hostOfUrl(item.site || item.endpoint);
+        if (!host || seenHosts.has(host)) continue;
+        seenHosts.add(host);
+        extraUpstreams.push({ ...item, source: "extra" });
+      }
+    }
+
+    const verifyExtras = String((env && env.HUANGGUO_VERIFY_EXTRAS) || "1") !== "0";
+    const aliveExtras = verifyExtras
+      ? await filterAliveUpstreams(extraUpstreams, env)
+      : extraUpstreams;
+
+    const mirrorSites = mirrorUpstreams(native, native.mirrors || []);
+    const allUpstreams = [
+      native,
+      ...mirrorSites,
+      ...configUpstreams,
+      ...aliveExtras,
+    ].slice(0, 140);
     const pool = hydratePool({
       source: "auto",
       updatedAt: Date.now(),
       expiresAt: Date.now() + poolTtl(env),
-      upstreams: [native, ...configUpstreams],
+      upstreams: allUpstreams,
     });
 
     // 保证至少有一个可用上游。
@@ -848,6 +903,70 @@ function parseMirrorsFromPrevious(pool) {
       ? pool.upstreams.find((item) => item.kind === "huangguo")
       : null;
   return native && Array.isArray(native.mirrors) ? native.mirrors : [];
+}
+
+/**
+ * 额外清单里的站先探一次活：能返回 JSON 列表的才进池子。
+ * 公共清单里死站很多，堆进来只会拖慢搜索、还占熔断名额。
+ */
+async function filterAliveUpstreams(items, env) {
+  if (!items.length) return [];
+  const checked = await mapLimit(items, 6, async (upstream) => {
+    const started = Date.now();
+    try {
+      const response = await fetchWithTimeout(
+        maccmsUrl(upstream, { ac: "videolist", pg: 1 }),
+        {
+          headers: {
+            "User-Agent": UA,
+            Referer: `${upstream.site || originOf(upstream.endpoint)}/`,
+            Accept: "application/json, text/plain, */*",
+          },
+        },
+        3500
+      );
+      if (!response.ok) return null;
+      const text = await response.text();
+      let data = null;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = null;
+      }
+      if (!data || !Array.isArray(data.list) || !data.list.length) return null;
+      markSuccess(upstream, Date.now() - started);
+      return upstream;
+    } catch {
+      return null;
+    }
+  });
+  return checked.filter(Boolean);
+}
+
+/**
+ * 把镜像线路做成独立的黄果源：同一套接口、不同站点域名。
+ * 国内哪条能直连就选哪条，主站被墙时不用改配置。
+ * searchable 设 false —— 合并搜索时跳过它们，避免同一批结果重复三份。
+ */
+function mirrorUpstreams(native, mirrors) {
+  const out = [];
+  const seen = new Set([hostOfUrl(native.site)]);
+  for (const mirror of mirrors) {
+    const host = hostOfUrl(mirror);
+    if (!host || seen.has(host)) continue;
+    seen.add(host);
+    const label = host.split(".")[0] || "mirror";
+    out.push({
+      key: `huangguo_mirror_${host.replace(/[^a-z0-9]+/gi, "_")}`,
+      slug: `huangguo-${label}`,
+      name: `黄果短剧·${label}`,
+      kind: "huangguo-site",
+      source: "mirror",
+      site: mirror,
+      searchable: false,
+    });
+  }
+  return out.slice(0, 3);
 }
 
 function scheduleRefresh(env, context) {
@@ -2076,7 +2195,9 @@ async function searchAll(pool, keyword, origin, env) {
         const result =
           upstream.kind === "huangguo"
             ? await nativeSearch(upstream, keyword, origin, env)
-            : await maccmsSearch(upstream, keyword, origin, env);
+            : upstream.kind === "huangguo-site"
+              ? await siteSearch(upstream, keyword, origin, env)
+              : await maccmsSearch(upstream, keyword, origin, env);
         for (const warning of result.warnings || []) {
           warnings.push({
             ...warning,
@@ -2268,7 +2389,7 @@ async function handleList(url, pool, env) {
     );
   }
 
-  if (upstream.kind === "huangguo") {
+  if (upstream.kind === "huangguo" || upstream.kind === "huangguo-site") {
     return jsonResponse({
       code: 1,
       msg: "数据列表",
@@ -2307,7 +2428,9 @@ async function handleDetailList(url, pool, env) {
         const result =
           upstream.kind === "huangguo"
             ? await nativeSearch(upstream, keyword, origin, env)
-            : await maccmsSearch(upstream, keyword, origin, env);
+            : upstream.kind === "huangguo-site"
+              ? await siteSearch(upstream, keyword, origin, env)
+              : await maccmsSearch(upstream, keyword, origin, env);
         const list = result.list.map((item) => decorateSearchItem(item, upstream));
         return jsonResponse({
           code: 1,
@@ -2406,7 +2529,9 @@ async function handleDetail(url, pool, env) {
     const result =
       upstream.kind === "huangguo"
         ? await nativeDetail(upstream, parsed.firstId, url.origin, env)
-        : await maccmsDetail(upstream, parsed.ids, url.origin, env);
+        : upstream.kind === "huangguo-site"
+          ? await siteDetail(upstream, parsed.firstId, url.origin, env)
+          : await maccmsDetail(upstream, parsed.ids, url.origin, env);
 
     if (result.status === "not_found") {
       return jsonResponse({
@@ -3173,7 +3298,9 @@ function rankedUpstreams(pool, preferred) {
  * 其他 MacCMS 站各算各的，绝不跨站顶替——否则黄果源里会播出别家的片子。
  */
 function familyOf(upstream) {
-  return upstream.kind === "huangguo" || upstream.kind === "huangguo-me"
+  return upstream.kind === "huangguo" ||
+    upstream.kind === "huangguo-me" ||
+    upstream.kind === "huangguo-site"
     ? "huangguo"
     : upstream.slug;
 }
@@ -3308,6 +3435,32 @@ async function resolveCandidatePlay(candidate, ctx) {
       return { url: "", referer: "", attempts };
     }
     return { url: "", referer: "", attempts: native.attempts };
+  }
+
+  if (candidate.kind === "huangguo-site") {
+    const direct = await resolveSitePlay(candidate, id, ep, env, pageHint);
+    if (isHttpUrl(direct.url)) {
+      return {
+        url: direct.url,
+        referer: `${candidate.site}/`,
+        preferDirect: direct.preferDirect !== false,
+        attempts: direct.attempts,
+      };
+    }
+    // 镜像站没源时，按剧名去新站碰碰运气。
+    if (title) {
+      const me = await resolveHuangguoMeByTitle(title, ep, env);
+      if (isHttpUrl(me.stream)) {
+        return {
+          url: me.stream,
+          referer: me.playPage || `${HUANGGUO_ME}/`,
+          preferDirect: false,
+          attempts: [...direct.attempts, ...me.attempts],
+        };
+      }
+      return { url: "", referer: "", attempts: [...direct.attempts, ...me.attempts] };
+    }
+    return { url: "", referer: "", attempts: direct.attempts };
   }
 
   if (candidate.kind === "huangguo-me") {
@@ -3618,6 +3771,143 @@ async function handlePlayCheck(url, pool, env) {
     ep,
     rows,
   });
+}
+
+/* -------------------------------------------------------------------------- */
+/* 镜像站直连（kind: huangguo-site）                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 镜像站自己有完整接口，可以不依赖那个 Worker：
+ *   /api/search?q=        搜索
+ *   /api/videos/{id}      详情（带 episodes）
+ *   /api/videos/{id}/play?ep=N  单集播放
+ * 国内哪条镜像能直连就走哪条，主站被墙时也有活路。
+ */
+function toSiteVod(vod, upstream, origin) {
+  const tags = Array.isArray(vod.tags)
+    ? vod.tags.map((item) => (typeof item === "string" ? item : item && item.name))
+    : [];
+  return {
+    vod_id: String(vod.id != null ? vod.id : ""),
+    vod_name: String(vod.title || vod.name || ""),
+    vod_pic: proxyPicture(origin, upstream, vod.cover || ""),
+    vod_remarks: vod.is_finished
+      ? `全${vod.episode_count || vod.total_episodes || ""}集`
+      : vod.episode_count
+        ? `更新至${vod.episode_count}集`
+        : "",
+    type_name: String(tags.filter(Boolean)[0] || ""),
+    vod_year: String((vod.created_at || "").slice(0, 4)),
+    vod_area: "",
+    vod_score: String(vod.score || ""),
+  };
+}
+
+async function siteSearch(upstream, keyword, origin, env) {
+  const { data } = await requestUpstreamJson(
+    upstream,
+    `${upstream.site}/api/search?q=${encodeURIComponent(keyword)}&page=1&size=30`,
+    env,
+    { timeoutMs: 9000 }
+  );
+  const items =
+    data && data.data && Array.isArray(data.data.items) ? data.data.items : [];
+  return {
+    list: items
+      .map((item) => toSiteVod(item, upstream, origin))
+      .filter((item) => item.vod_id && item.vod_name),
+    warnings: [],
+  };
+}
+
+async function siteDetail(upstream, id, origin, env) {
+  const { data } = await requestUpstreamJson(
+    upstream,
+    `${upstream.site}/api/videos/${encodeURIComponent(id)}`,
+    env,
+    { timeoutMs: 9000 }
+  );
+  const vod = (data && data.data) || null;
+  if (!vod) return { status: "not_found" };
+
+  const episodes = Array.isArray(vod.episodes) ? vod.episodes.slice(0, 100) : [];
+  if (!episodes.length) {
+    throw new UpstreamError(
+      upstream,
+      "no_playable",
+      `镜像站「${upstream.name}」返回了详情，但 episodes 为空`,
+      { status: 200, details: { id: String(id), episodes: 0 } }
+    );
+  }
+
+  const playUrls = episodes.map((ep, index) => {
+    const number = String(ep.ep_num || index + 1);
+    const title = `第${number}集`;
+    return `${title}$${lazyPlayUrl(
+      origin,
+      upstream,
+      id,
+      number,
+      "",
+      vod.title || ""
+    )}`;
+  });
+
+  return {
+    status: "ok",
+    vod: {
+      ...toSiteVod(vod, upstream, origin),
+      vod_id: String(vod.id != null ? vod.id : id),
+      vod_play_from: "黄果",
+      vod_play_url: playUrls.join("#"),
+      vod_content: String(vod.description || ""),
+    },
+  };
+}
+
+/** 镜像站单集解析：站内接口 → 剧集页兜底。 */
+async function resolveSitePlay(upstream, id, ep, env, pageHint) {
+  const attempts = [];
+  try {
+    const { data, status } = await requestUpstreamJson(
+      upstream,
+      `${upstream.site}/api/videos/${encodeURIComponent(id)}/play?ep=${encodeURIComponent(ep)}`,
+      env,
+      { timeoutMs: 9000 }
+    );
+    const detail = (data && data.data) || {};
+    const url =
+      String(detail.video_url || detail.video_url_hevc || "").trim() ||
+      deepFindMediaUrl(data);
+    if (isHttpUrl(url)) {
+      attempts.push({ step: "site-play", ok: true, status });
+      return { url, attempts, preferDirect: true };
+    }
+    const duration = Number(detail.duration || 0);
+    attempts.push({
+      step: "site-play",
+      ok: false,
+      status,
+      ...(duration > 0
+        ? { kind: "media_pending", reason: "上游返回了时长但没有播放地址", duration }
+        : { reason: "empty video_url" }),
+    });
+  } catch (error) {
+    attempts.push({ step: "site-play", ok: false, ...playAttemptError(error) });
+  }
+
+  const pageUrl = isHttpUrl(pageHint)
+    ? pageHint
+    : `${upstream.site}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`;
+  const stream = await fetchPageStream(upstream, pageUrl, ep, 8000);
+  attempts.push({
+    step: "page",
+    ok: !!stream,
+    ...(stream ? {} : { reason: "no media" }),
+  });
+  if (stream) return { url: stream, attempts, preferDirect: true };
+  return { url: "", attempts };
 }
 
 /**

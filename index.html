@@ -82,8 +82,9 @@
           var managed = [];
           (data.upstreams || []).forEach(function (item) {
             if (!item || !item.slug) return;
-            // 默认黄果继续用同步注册的 key=huangguo 源，避免重复。
-            if (item.kind === "huangguo" || item.slug === data.defaultSlug) return;
+            // 默认黄果继续用同步注册的 key=huangguo 源，避免重复；
+            // 其他黄果线路（镜像站）单独列成一个源，方便国内直连时换线。
+            if (item.slug === data.defaultSlug) return;
             managed.push({
               key: MANAGED_PREFIX + item.slug,
               name: item.name || item.slug,
