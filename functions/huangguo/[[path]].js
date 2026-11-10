@@ -163,11 +163,16 @@ function namespaceId(upstream, id) {
   return raw.startsWith(prefix) ? raw : `${prefix}${raw}`;
 }
 
-function lazyPlayUrl(origin, upstream, id, ep) {
+function lazyPlayUrl(origin, upstream, id, ep, pageUrl) {
   // 结尾必须是 .m3u8，Artplayer 靠扩展名选择 customType.m3u8 / Hls.js。
-  return `${origin}/huangguo/play.m3u8?up=${encodeURIComponent(
-    upstream.slug
-  )}&id=${encodeURIComponent(id)}&ep=${encodeURIComponent(ep)}`;
+  // page 是详情里这一集的真实页面地址；Worker 的页面兜底需要它。
+  const params = new URLSearchParams({
+    up: upstream.slug,
+    id: String(id),
+    ep: String(ep),
+  });
+  if (isHttpUrl(pageUrl)) params.set("page", pageUrl);
+  return `${origin}/huangguo/play.m3u8?${params.toString()}`;
 }
 
 function searchSourceKey(upstream) {
@@ -1243,39 +1248,92 @@ async function fetchPageStream(upstream, pageUrl, ep, timeoutMs) {
  * no_playable。详情阶段改为生成 /huangguo/play.m3u8?... 的惰性地址，
  * 点哪集解析哪集；解析顺序：Worker /api/play → 源站官方接口 → 页面兜底。
  */
-async function resolveNativePlay(upstream, id, ep, env) {
+function playAttemptError(error) {
+  if (error instanceof UpstreamError) {
+    return {
+      kind: error.kind,
+      status: error.status,
+      ms: error.ms,
+      message: String(error.message || "").slice(0, 180),
+    };
+  }
+  return {
+    kind: "error",
+    message: String((error && error.message) || error || "").slice(0, 180),
+  };
+}
+
+/**
+ * 把单集解析推迟到用户真正点播时。
+ *
+ * 关键点：Worker 的 /api/play 虽然也接受数字 id，但它的页面兜底是
+ * getHtml(page)；传数字 id 时这一步会失败。所以优先把详情里的
+ * episodes[].url（真实剧集页地址）作为 url 参数传给 Worker。
+ *
+ * 解析顺序：详情直链/剧集页 → 吃瓜帖子 → Worker /api/play（页面地址）
+ * → 源站官方接口 → 剧集页 videoInitialData/m3u8。
+ * 每次失败都记录 attempts，最终 502 JSON 会带上，方便定位。
+ */
+async function resolveNativePlay(upstream, id, ep, env, pageHint) {
   const deadline = Date.now() + 25000;
   const remaining = (max) =>
     Math.max(1000, Math.min(max || 25000, deadline - Date.now()));
+  const attempts = [];
   const archives = String(id).startsWith("archives_");
+  const pid = archives ? String(id).slice("archives_".length) : "";
+  let detailPageUrl = isHttpUrl(pageHint) ? String(pageHint).trim() : "";
 
-  if (archives) {
-    const pid = String(id).slice("archives_".length);
-
-    // 吃瓜图文帖：Worker 的 detail 里可能直接带 episodes[0].url。
+  // 没有页面地址时才回详情里找；有 pageHint 时直接进入播放解析，少一次请求。
+  if (!detailPageUrl) {
     try {
-      const { data } = await requestUpstreamJson(
+      const started = Date.now();
+      const { data, status } = await requestUpstreamJson(
         upstream,
         `${upstream.api}/api/detail/${encodeURIComponent(id)}`,
         env,
-        { timeoutMs: remaining(8000) }
+        { timeoutMs: remaining(6000) }
       );
       const item = (Array.isArray(data.list) && data.list[0]) || null;
-      const url =
-        item && Array.isArray(item.episodes) && item.episodes[0]
-          ? String(item.episodes[0].url || "")
-          : "";
-      if (isDirectMediaUrl(url)) return url;
-    } catch {
-      // 继续尝试帖子接口。
-    }
+      const episodes = item && Array.isArray(item.episodes) ? item.episodes : [];
+      const match =
+        episodes.find((entry) => String(entry.ep) === String(ep)) ||
+        episodes[Number(ep) - 1] ||
+        episodes[0] ||
+        null;
+      const url = match ? String(match.url || "").trim() : "";
 
+      if (isDirectMediaUrl(url)) {
+        attempts.push({
+          step: "detail",
+          ok: true,
+          via: "direct",
+          status,
+          ms: Date.now() - started,
+        });
+        return { url, attempts };
+      }
+      if (isHttpUrl(url)) detailPageUrl = url;
+      attempts.push({
+        step: "detail",
+        ok: !!detailPageUrl,
+        status,
+        ms: Date.now() - started,
+        hasEpisodePage: !!detailPageUrl,
+      });
+    } catch (error) {
+      attempts.push({ step: "detail", ok: false, ...playAttemptError(error) });
+    }
+  }
+
+  // 吃瓜图文帖：帖子接口里的 video_url / 正文 m3u8，再退到吃瓜页面。
+  if (archives) {
     try {
-      const { data } = await requestUpstreamJson(
+      const started = Date.now();
+      const { data, status } = await requestUpstreamJson(
         upstream,
         `${upstream.site}/api/posts/${encodeURIComponent(pid)}`,
         env,
-        { timeoutMs: remaining(6000) }
+        { timeoutMs: remaining(5000) }
       );
       let url = String((data.data && data.data.video_url) || "");
       if (!url) {
@@ -1284,63 +1342,122 @@ async function resolveNativePlay(upstream, id, ep, env) {
         );
         if (matched) url = matched[0].replace(/&amp;/g, "&");
       }
-      if (isHttpUrl(url)) return url;
-    } catch {
-      // 继续尝试吃瓜页面。
+      if (isHttpUrl(url)) {
+        attempts.push({
+          step: "archives-post",
+          ok: true,
+          status,
+          ms: Date.now() - started,
+        });
+        return { url, attempts };
+      }
+      attempts.push({
+        step: "archives-post",
+        ok: false,
+        status,
+        ms: Date.now() - started,
+        reason: "empty video_url",
+      });
+    } catch (error) {
+      attempts.push({ step: "archives-post", ok: false, ...playAttemptError(error) });
     }
 
+    const started = Date.now();
     const archivePage = await fetchPageStream(
       upstream,
       `${upstream.site}/archives/${encodeURIComponent(pid)}/`,
       "1",
-      remaining(6000)
+      remaining(5000)
     );
-    if (archivePage) return archivePage;
+    attempts.push({
+      step: "archives-page",
+      ok: !!archivePage,
+      ms: Date.now() - started,
+      ...(archivePage ? {} : { reason: "no media" }),
+    });
+    if (archivePage) return { url: archivePage, attempts };
   }
 
+  // Worker /api/play：优先传真实剧集页地址，让 Worker 的页面兜底可用。
   try {
-    const { data } = await requestUpstreamJson(
+    const started = Date.now();
+    const target = detailPageUrl || id;
+    const { data, status } = await requestUpstreamJson(
       upstream,
-      `${upstream.api}/api/play?url=${encodeURIComponent(id)}&ep=${encodeURIComponent(ep)}`,
+      `${upstream.api}/api/play?url=${encodeURIComponent(target)}&ep=${encodeURIComponent(ep)}`,
       env,
-      { timeoutMs: remaining(archives ? 8000 : 12000) }
+      { timeoutMs: remaining(archives ? 6000 : 12000) }
     );
-
     const direct = typeof data.url === "string" ? data.url.trim() : "";
     const proxy = typeof data.proxy === "string" ? data.proxy.trim() : "";
+    const ms = Date.now() - started;
+
     if (
       isHttpUrl(direct) &&
       !(direct.startsWith("http://") && proxy.startsWith("https://"))
     ) {
-      return direct;
+      attempts.push({ step: "worker-play", ok: true, via: "direct", status, ms });
+      return { url: direct, attempts };
     }
-    if (isHttpUrl(proxy)) return proxy;
-  } catch {
-    // Worker play 失败，继续问源站官方接口。
+    if (isHttpUrl(proxy)) {
+      attempts.push({ step: "worker-play", ok: true, via: "proxy", status, ms });
+      return { url: proxy, attempts };
+    }
+    attempts.push({
+      step: "worker-play",
+      ok: false,
+      status,
+      ms,
+      reason: "empty url/proxy",
+    });
+  } catch (error) {
+    attempts.push({ step: "worker-play", ok: false, ...playAttemptError(error) });
   }
 
-  // 旧版 Worker 的 /api/play 可能返回空 url；再直接问一次源站官方接口。
+  // 源站官方播放接口。
   try {
-    const { data: siteData } = await requestUpstreamJson(
+    const started = Date.now();
+    const { data, status } = await requestUpstreamJson(
       upstream,
       `${upstream.site}/api/videos/${encodeURIComponent(id)}/play?ep=${encodeURIComponent(ep)}`,
       env,
-      { timeoutMs: remaining(6000) }
+      { timeoutMs: remaining(5000) }
     );
     const siteUrl = String(
-      (siteData.data && siteData.data.video_url) || siteData.video_url || ""
+      (data.data && data.data.video_url) || data.video_url || ""
     ).trim();
-    if (isHttpUrl(siteUrl)) return siteUrl;
-  } catch {
-    // 源站接口失败，继续页面兜底。
+    const ms = Date.now() - started;
+    if (isHttpUrl(siteUrl)) {
+      attempts.push({ step: "site-play", ok: true, status, ms });
+      return { url: siteUrl, attempts };
+    }
+    attempts.push({
+      step: "site-play",
+      ok: false,
+      status,
+      ms,
+      reason: "empty video_url",
+    });
+  } catch (error) {
+    attempts.push({ step: "site-play", ok: false, ...playAttemptError(error) });
   }
 
-  // 最后一层：直接抓详情页里的 videoInitialData / m3u8。
+  // 最后一层：抓剧集页。优先用详情里的精确 ep.url，再退回拼 URL。
   const pageUrl =
-    ep === "1"
+    detailPageUrl ||
+    (ep === "1"
       ? `${upstream.site}/video/${encodeURIComponent(id)}/`
-      : `${upstream.site}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`;
-  return fetchPageStream(upstream, pageUrl, ep, remaining(6000));
+      : `${upstream.site}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`);
+  const started = Date.now();
+  const pageStream = await fetchPageStream(upstream, pageUrl, ep, remaining(5000));
+  attempts.push({
+    step: "page",
+    ok: !!pageStream,
+    ms: Date.now() - started,
+    ...(pageStream ? {} : { reason: "no media" }),
+  });
+
+  return { url: pageStream || "", attempts };
 }
 
 async function nativeDetail(upstream, id, origin, env) {
@@ -1374,8 +1491,9 @@ async function nativeDetail(upstream, id, origin, env) {
     const title = String(ep.title || `第${epNumber}集`).replace(/\$/g, " ");
     let url = String(ep.url || "").trim();
     if (url.startsWith("//")) url = `https:${url}`;
+    const pageUrl = isHttpUrl(url) ? url : "";
     if (!isDirectMediaUrl(url)) {
-      url = lazyPlayUrl(origin, upstream, id, epNumber);
+      url = lazyPlayUrl(origin, upstream, id, epNumber, pageUrl);
     }
     return `${title}$${url}`;
   });
@@ -2004,6 +2122,7 @@ async function handlePlay(url, pool, env) {
   const id = String(url.searchParams.get("id") || "").trim();
   const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
   const slug = String(url.searchParams.get("up") || "").trim();
+  const pageHint = String(url.searchParams.get("page") || "").trim();
 
   if (!id) return jsonResponse({ code: 0, msg: "缺少 id", list: [] }, 400);
 
@@ -2015,11 +2134,14 @@ async function handlePlay(url, pool, env) {
     );
   }
 
+  let attempts = [];
   try {
     let target = "";
 
     if (upstream.kind === "huangguo") {
-      target = await resolveNativePlay(upstream, id, ep, env);
+      const resolved = await resolveNativePlay(upstream, id, ep, env, pageHint);
+      target = resolved.url;
+      attempts = resolved.attempts;
     } else {
       const detail = await maccmsDetail(upstream, id, url.origin, env);
       if (detail.status === "ok") {
@@ -2039,6 +2161,7 @@ async function handlePlay(url, pool, env) {
           msg: "上游没有返回可播放地址",
           kind: "no_playable",
           upstream: upstream.slug,
+          attempts,
           list: [],
         },
         502
@@ -2065,6 +2188,7 @@ async function handlePlay(url, pool, env) {
         kind: err.kind,
         upstream: err.upstream,
         detail: err.toJSON(),
+        attempts,
         list: [],
       },
       502

@@ -120,6 +120,20 @@ const nativePageFallbackDetail = {
   ],
 };
 
+// 所有播放兜底都失败：502 应带 attempts，说明每一步失败原因。
+const nativeNoMediaDetail = {
+  list: [
+    {
+      vod_id: 12800,
+      vod_name: "无片源测试",
+      vod_pic: "https://img.test/cover.jpg",
+      episodes: [
+        { ep: 1, title: "第1集", url: "https://site.test/video/12800/ep-1/" },
+      ],
+    },
+  ],
+};
+
 // 详情存在但 episodes 为空：应明确报 no_playable，而不是“没有找到内容”。
 const nativeEmptyDetail = {
   list: [
@@ -207,9 +221,11 @@ globalThis.fetch = async (input, init = {}) => {
     if (parsed.pathname === "/api/detail/12527") return json(nativeDetail);
     if (parsed.pathname === "/api/detail/12600") return json(nativeLazyDetail);
     if (parsed.pathname === "/api/detail/12700") return json(nativePageFallbackDetail);
+    if (parsed.pathname === "/api/detail/12800") return json(nativeNoMediaDetail);
     if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
     if (parsed.pathname === "/api/play") {
-      if (parsed.searchParams.get("url") === "12700") {
+      const target = String(parsed.searchParams.get("url") || "");
+      if (target.includes("12700") || target.includes("12800")) {
         return json({ url: "", proxy: "" });
       }
       return json({ url: "https://cdn.test/play.m3u8" });
@@ -441,6 +457,10 @@ async function main() {
   await show("6b. 网页剧集地址转惰性播放地址", path, result);
   const lazyUrl = result.body.list[0].vod_play_url.split("#")[0].split("$")[1];
   expect(lazyUrl.includes("/huangguo/play.m3u8?"), "lazy play url");
+  expect(
+    new URL(lazyUrl).searchParams.get("page") === "https://site.test/video/12600/ep-1/",
+    "lazy play page hint"
+  );
   expect(result.body.list[0].vod_play_url.split("#").length === 2, "two lazy episodes");
 
   // 6c. 点播时才请求上游 /api/play，并 302 到真实流。
@@ -467,6 +487,22 @@ async function main() {
   expect(
     result.response.headers.get("location") === "https://cdn.test/from-page.m3u8",
     "page fallback location"
+  );
+
+  // 6f. 所有兜底都失败时，502 JSON 必须带 attempts。
+  path = "/huangguo/api.php/provide/vod/?ac=detail&ids=12800";
+  result = await call(path);
+  await show("6f. 无片源详情生成惰性地址", path, result);
+  const noMediaLazy = result.body.list[0].vod_play_url.split("#")[0].split("$")[1];
+  const noMediaPath = new URL(noMediaLazy).pathname + new URL(noMediaLazy).search;
+  result = await call(noMediaPath);
+  await show("6g. 全部兜底失败返回 attempts", noMediaPath, result);
+  expect(result.status === 502, "no media 502");
+  expect(result.body.kind === "no_playable", "no media kind");
+  expect(Array.isArray(result.body.attempts) && result.body.attempts.length >= 2, "attempts present");
+  expect(
+    result.body.attempts.some((item) => item.step === "worker-play" && item.ok === false),
+    "worker attempt visible"
   );
 
   // 7. MacCMS 上游按 slug 路由 + ac=list。
