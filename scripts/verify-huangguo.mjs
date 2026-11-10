@@ -761,7 +761,9 @@ async function main() {
   path = "/huangguo/api.php/provide/vod/?ac=detail&ids=12700";
   result = await call(path);
   await show("6d. Worker play 为空时回退页面", path, result);
-  const fallbackLazy = result.body.list[0].vod_play_url.split("#")[1].split("$")[1];
+  // 逐集探测会把没有源的集过滤掉，这里取剩下的最后一集（就是页面兜底那集）。
+  const fallbackEpisodes = result.body.list[0].vod_play_url.split("#");
+  const fallbackLazy = fallbackEpisodes[fallbackEpisodes.length - 1].split("$")[1];
   const fallbackPath = new URL(fallbackLazy).pathname + new URL(fallbackLazy).search;
   result = await call(fallbackPath);
   await show("6e. 页面兜底 302 到真实流", fallbackPath, result);

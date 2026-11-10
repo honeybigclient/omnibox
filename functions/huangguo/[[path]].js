@@ -1988,6 +1988,30 @@ async function nativeDetail(upstream, id, origin, env) {
     });
   }
 
+  // 只保留真能出流的集数（带缓存；探测挂了就放行，不误杀）。
+  if (
+    episodes.length > 1 &&
+    String((env && env.HUANGGUO_FILTER_PLAYABLE) || "1") !== "0"
+  ) {
+    const filtered = await filterEpisodesByPlayable(
+      upstream,
+      id,
+      episodes,
+      item.vod_name || "",
+      env
+    );
+    if (filtered.length) {
+      episodes = filtered;
+    } else if (episodes.length) {
+      throw new UpstreamError(
+        upstream,
+        "no_playable",
+        `「${item.vod_name || id}」逐集检查后没有可播放的源（可能刚更新或站点未生成地址）`,
+        { status: 200, details: { id: String(id), episodes: episodes.length } }
+      );
+    }
+  }
+
   const playUrls = episodes.map((ep, index) => {
     const epNumber = String(ep.ep || index + 1);
     const title = String(ep.title || `第${epNumber}集`).replace(/\$/g, " ");
@@ -2488,13 +2512,19 @@ async function handleDetailList(url, pool, env) {
   }
 
   const page = Math.max(1, Number(url.searchParams.get("pg")) || 1);
-  const typeId = url.searchParams.get("t") || (upstream.kind === "huangguo" ? "ai-duanju" : "");
+  const typeId =
+    url.searchParams.get("t") ||
+    (upstream.kind === "huangguo" || upstream.kind === "huangguo-site"
+      ? "ai-duanju"
+      : "");
 
   try {
     const result =
       upstream.kind === "huangguo"
         ? await nativeList(upstream, typeId, page, origin, env)
-        : await maccmsList(upstream, typeId, page, origin, env);
+        : upstream.kind === "huangguo-site"
+          ? await siteList(upstream, typeId, page, origin, env)
+          : await maccmsList(upstream, typeId, page, origin, env);
     return jsonResponse({
       code: 1,
       msg: "数据列表",
@@ -3773,6 +3803,110 @@ async function handlePlayCheck(url, pool, env) {
   });
 }
 
+/**
+ * 逐集探测"到底能不能播"，只保留能出流的集数。
+ *
+ * 站点详情经常列出 N 集、实际只有前几集有片源（或者刚更新还没生成），
+ * 用户在播放器里点到后面全是空转。这里在详情阶段就把不能播的集去掉，
+ * 结果按 (源, 剧) 缓存 10 分钟；探测全挂（网络问题）时放行，不误杀。
+ */
+const PLAYABLE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function probePlayableEpisodes(upstream, id, episodes, title, env) {
+  const cacheUrl = `https://huangguo.internal/__playable_v2/${encodeURIComponent(
+    upstream.slug
+  )}/${encodeURIComponent(id)}`;
+  const now = Date.now();
+
+  if (typeof caches !== "undefined" && caches.default) {
+    try {
+      const hit = await caches.default.match(cacheUrl);
+      if (hit) {
+        const cached = await hit.json();
+        if (cached && now - Number(cached.at || 0) < PLAYABLE_CACHE_TTL_MS) {
+          const okSet = new Set((cached.ok || []).map(String));
+          // 缓存没覆盖到的集（比如集数变了）就不过滤那几集。
+          return {
+            ok: okSet,
+            covered: new Set((cached.checked || []).map(String)),
+            fromCache: true,
+          };
+        }
+      }
+    } catch {
+      // 缓存坏了就重新探。
+    }
+  }
+
+  const checked = new Set();
+  const ok = new Set();
+  let errors = 0;
+  const deadline = Date.now() + 12000;
+
+  await mapLimit(episodes.slice(0, 20), 4, async (ep, index) => {
+    const epNumber = String(ep.ep || index + 1);
+    // 超过总预算就不再探，未探测的集按"可播"放行，避免误删。
+    if (Date.now() > deadline) return;
+    checked.add(epNumber);
+    try {
+      const result = await resolveCandidatePlay(upstream, {
+        id,
+        ep: epNumber,
+        pageHint: "",
+        title: title || "",
+        env,
+        budgetMs: 6000,
+      });
+      if (isHttpUrl(result.url)) ok.add(epNumber);
+    } catch {
+      errors += 1;
+    }
+  });
+
+  // 探测几乎全错——大概率网络问题，别据此把整部剧清空。
+  if (errors >= Math.max(1, Math.ceil(checked.size * 0.6))) {
+    return { ok: null, covered: checked, fromCache: false };
+  }
+
+  if (typeof caches !== "undefined" && caches.default && checked.size) {
+    try {
+      await caches.default.put(
+        cacheUrl,
+        new Response(
+          JSON.stringify({
+            at: Date.now(),
+            ok: [...ok],
+            checked: [...checked],
+          }),
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "max-age=600",
+            },
+          }
+        )
+      );
+    } catch {
+      // 写缓存失败不影响本次结果。
+    }
+  }
+
+  return { ok, covered: checked, fromCache: false };
+}
+
+/** 按探测结果过滤剧集；返回过滤后的数组。 */
+async function filterEpisodesByPlayable(upstream, id, episodes, title, env) {
+  if (!episodes.length) return episodes;
+  const probe = await probePlayableEpisodes(upstream, id, episodes, title, env);
+  if (!probe.ok) return episodes;
+  const kept = episodes.filter((ep, index) => {
+    const n = String(ep.ep || index + 1);
+    if (!probe.covered.has(n)) return true;
+    return probe.ok.has(n);
+  });
+  return kept;
+}
+
 /* -------------------------------------------------------------------------- */
 /* 镜像站直连（kind: huangguo-site）                                            */
 /* -------------------------------------------------------------------------- */
@@ -3821,6 +3955,40 @@ async function siteSearch(upstream, keyword, origin, env) {
   };
 }
 
+/**
+ * 镜像站列表：/api/videos?category=&sort=&page=&size=
+ * 榜单接口（/api/ranks）返回的项目没有 id，没法跳详情，所以榜单也走
+ * /api/videos?sort=hot，保证每项都能点进去。
+ */
+async function siteList(upstream, typeId, page, origin, env) {
+  const size = 50;
+  const isRank = String(typeId || "").startsWith("rank:");
+  const target = isRank
+    ? `${upstream.site}/api/videos?sort=hot&page=${page}&size=${size}`
+    : `${upstream.site}/api/videos?category=${encodeURIComponent(
+        typeId || "ai-duanju"
+      )}&page=${page}&size=${size}&sort=latest`;
+
+  const { data } = await requestUpstreamJson(upstream, target, env, {
+    timeoutMs: 9000,
+  });
+  const payload = (data && data.data) || {};
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  return {
+    list: items
+      .map((item) => toSiteVod(item, upstream, origin))
+      .filter((item) => item.vod_id && item.vod_name),
+    pageCount: Number(
+      (payload.pagination &&
+        (payload.pagination.pages ||
+          payload.pagination.page_count ||
+          payload.pagination.total_pages)) ||
+        payload.page_count ||
+        page
+    ),
+  };
+}
+
 async function siteDetail(upstream, id, origin, env) {
   const { data } = await requestUpstreamJson(
     upstream,
@@ -3841,8 +4009,35 @@ async function siteDetail(upstream, id, origin, env) {
     );
   }
 
+  if (
+    episodes.length > 1 &&
+    String((env && env.HUANGGUO_FILTER_PLAYABLE) || "1") !== "0"
+  ) {
+    const normalized = episodes.map((ep, index) => ({
+      ...ep,
+      ep: String(ep.ep_num || index + 1),
+    }));
+    const filtered = await filterEpisodesByPlayable(
+      upstream,
+      id,
+      normalized,
+      vod.title || "",
+      env
+    );
+    episodes.length = 0;
+    episodes.push(...filtered);
+    if (!episodes.length) {
+      throw new UpstreamError(
+        upstream,
+        "no_playable",
+        `「${vod.title || id}」逐集检查后没有可播放的源`,
+        { status: 200, details: { id: String(id), episodes: normalized.length } }
+      );
+    }
+  }
+
   const playUrls = episodes.map((ep, index) => {
-    const number = String(ep.ep_num || index + 1);
+    const number = String(ep.ep_num || ep.ep || index + 1);
     const title = `第${number}集`;
     return `${title}$${lazyPlayUrl(
       origin,
