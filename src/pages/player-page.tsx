@@ -537,7 +537,82 @@ function PlayerPage() {
             if (Hls.isSupported()) {
               let current: Hls | null = null;
               let watchdog = 0;
-              let proxyRetried = false;
+              // 0=初始 1=代理重试 2=浏览器解析 3=浏览器地址走代理
+              let stage = 0;
+
+              // 用用户浏览器直接抓剧集页，从 videoInitialData 里取 m3u8。
+              // 站点对浏览器是放行的、地址里的 ticket 也绑用户的 IP，直连能拿完整片源。
+              const resolveFromBrowser = async (): Promise<string> => {
+                let parsed: URL;
+                try {
+                  parsed = new URL(url, window.location.origin);
+                } catch {
+                  return "";
+                }
+                const id = parsed.searchParams.get("id") || "";
+                const ep = parsed.searchParams.get("ep") || "1";
+                let page = parsed.searchParams.get("page") || "";
+                if (!/^https?:\/\//i.test(page)) {
+                  const up = parsed.searchParams.get("up") || "";
+                  const host = /adihsppe|thu|pku|fdu/.test(up)
+                    ? "https://thu.adihsppe.cc"
+                    : "https://huangguoai.com";
+                  page = `${host}/video/${encodeURIComponent(
+                    id
+                  )}/ep-${encodeURIComponent(ep)}/`;
+                }
+                const cacheKey = `hgBrowserPlay:${page}`;
+                try {
+                  const cached = sessionStorage.getItem(cacheKey);
+                  if (cached) return cached;
+                } catch {
+                  // 隐私模式读不到就现抓。
+                }
+                try {
+                  const response = await fetch(page, {
+                    credentials: "omit",
+                    cache: "no-store",
+                  });
+                  if (!response.ok) return "";
+                  const html = await response.text();
+                  let stream = "";
+                  const script = html.match(
+                    /id="videoInitialData"[^>]*>([\s\S]*?)<\/script>/
+                  );
+                  if (script) {
+                    try {
+                      const data = JSON.parse(script[1]);
+                      const srcs = data.epPlaySrcs || {};
+                      stream = srcs[String(ep)] || srcs[ep] || data.videoSrc || "";
+                    } catch {
+                      stream = "";
+                    }
+                  }
+                  if (!stream) {
+                    const match = html.match(
+                      /https?:\/\/[^"'<>\s]+?\.m3u8[^"'<>\s]*/
+                    );
+                    if (match) stream = match[0];
+                  }
+                  stream = String(stream)
+                    .replace(/\\u0026/g, "&")
+                    .replace(/\\\//g, "/");
+                  if (!/^https?:\/\//i.test(stream)) {
+                    const match = stream.match(/https?:\/\/[^\s"']+/);
+                    stream = match ? match[0] : "";
+                  }
+                  if (stream) {
+                    try {
+                      sessionStorage.setItem(cacheKey, stream);
+                    } catch {
+                      // 写不进去也不影响本次播放。
+                    }
+                  }
+                  return stream;
+                } catch {
+                  return "";
+                }
+              };
 
               const stopWatchdog = () => {
                 if (watchdog) {
@@ -563,6 +638,25 @@ function PlayerPage() {
                   // 不是 JSON 或者取不到，就用兜底文案。
                 }
                 return "无法加载播放列表";
+              };
+
+              const finish = (fallbackReason: string) => {
+                stopWatchdog();
+                if (current) {
+                  try {
+                    current.destroy();
+                  } catch {
+                    // 已经销毁过。
+                  }
+                }
+                const reason = fallbackReason || "播放失败";
+                if (String(reason).includes("manifest")) {
+                  void readManifestError(applyUserProxy(url)).then((message) =>
+                    failoverRef.current(message || reason)
+                  );
+                } else {
+                  failoverRef.current(reason);
+                }
               };
 
               const mount = (target: string) => {
@@ -623,28 +717,43 @@ function PlayerPage() {
                   }
 
                   const isManifest = String(data.details || "").includes("manifest");
-                  if (isManifest && !proxyRetried) {
+
+                  if (isManifest && stage === 0) {
                     // 直连拿不到清单（被拒/跨域）→ 同一源改走代理再试一次。
-                    proxyRetried = true;
+                    stage = 1;
                     art.notice.show = "直连失败，改走代理重试…";
-                    mount(toProxyRetry(target));
+                    mount(toProxyRetry(url));
                     return;
                   }
 
-                  stopWatchdog();
-                  try {
-                    hls.destroy();
-                  } catch {
-                    // 已经销毁过。
+                  if (isManifest && stage === 1) {
+                    // 适配层也拿不到 → 换成"用你的浏览器解析剧集页"。
+                    stage = 2;
+                    stopWatchdog();
+                    art.notice.show = "尝试用浏览器解析剧集页…";
+                    void resolveFromBrowser().then((stream) => {
+                      if (stream) {
+                        mount(stream);
+                        return;
+                      }
+                      finish(`${data.type}/${data.details}`);
+                    });
+                    return;
                   }
-                  const fallback = `${data.type}/${data.details}`;
-                  if (isManifest) {
-                    void readManifestError(applyUserProxy(target)).then((reason) =>
-                      failoverRef.current(reason || fallback)
+
+                  if (isManifest && stage === 2) {
+                    // 浏览器解析到了地址，但清单本身跨域被拦 → 走代理再试。
+                    stage = 3;
+                    art.notice.show = "解析到地址，改走代理再试…";
+                    mount(
+                      `${window.location.origin}/huangguo/hls?src=${encodeURIComponent(
+                        target
+                      )}`
                     );
-                  } else {
-                    failoverRef.current(fallback);
+                    return;
                   }
+
+                  finish(`${data.type}/${data.details}`);
                 });
 
                 hls.loadSource(applyUserProxy(target));

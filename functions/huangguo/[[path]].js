@@ -861,13 +861,12 @@ async function refreshPool(env) {
       ? await filterAliveUpstreams(extraUpstreams, env)
       : extraUpstreams;
 
-    const mirrorSites = mirrorUpstreams(native, native.mirrors || []);
-    const allUpstreams = [
-      native,
-      ...mirrorSites,
-      ...configUpstreams,
-      ...aliveExtras,
-    ].slice(0, 140);
+    // 镜像域名只留作"接口换线"用（native.mirrors），不再单独列成源：
+    // 它们和主站同一套后端，能浏览但同样播不了，列出来只会误导。
+    const allUpstreams = [native, ...configUpstreams, ...aliveExtras].slice(
+      0,
+      140
+    );
     const pool = hydratePool({
       source: "auto",
       updatedAt: Date.now(),
@@ -1267,7 +1266,7 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
         throw new UpstreamError(upstream, "upstream", message, { status, ms });
       }
 
-      markSuccess(upstream, ms);
+      if (!options.silent) markSuccess(upstream, ms);
       return { data, ms, status };
     } catch (error) {
       const ms = Date.now() - start;
@@ -1299,7 +1298,7 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
     new UpstreamError(upstream, "network", "没有可用的上游线路", {
       ms: Date.now() - startedAll,
     });
-  markFailure(upstream, err, env);
+  if (!options.silent) markFailure(upstream, err, env);
   throw err;
 }
 
@@ -1991,7 +1990,7 @@ async function nativeDetail(upstream, id, origin, env) {
   // 只保留真能出流的集数（带缓存；探测挂了就放行，不误杀）。
   if (
     episodes.length > 1 &&
-    String((env && env.HUANGGUO_FILTER_PLAYABLE) || "1") !== "0"
+    String((env && env.HUANGGUO_FILTER_PLAYABLE) || "0") === "1"
   ) {
     const filtered = await filterEpisodesByPlayable(
       upstream,
@@ -2002,14 +2001,8 @@ async function nativeDetail(upstream, id, origin, env) {
     );
     if (filtered.length) {
       episodes = filtered;
-    } else if (episodes.length) {
-      throw new UpstreamError(
-        upstream,
-        "no_playable",
-        `「${item.vod_name || id}」逐集检查后没有可播放的源（可能刚更新或站点未生成地址）`,
-        { status: 200, details: { id: String(id), episodes: episodes.length } }
-      );
     }
+    // 一集都没探到就保留原列表：探测本身可能被网络/熔断干扰，不能据此清空。
   }
 
   const playUrls = episodes.map((ep, index) => {
@@ -3856,6 +3849,8 @@ async function probePlayableEpisodes(upstream, id, episodes, title, env) {
         title: title || "",
         env,
         budgetMs: 6000,
+        // 探测是"打听一下"，不该触发熔断，也不该把源标成故障。
+        probe: true,
       });
       if (isHttpUrl(result.url)) ok.add(epNumber);
     } catch {
@@ -4007,33 +4002,6 @@ async function siteDetail(upstream, id, origin, env) {
       `镜像站「${upstream.name}」返回了详情，但 episodes 为空`,
       { status: 200, details: { id: String(id), episodes: 0 } }
     );
-  }
-
-  if (
-    episodes.length > 1 &&
-    String((env && env.HUANGGUO_FILTER_PLAYABLE) || "1") !== "0"
-  ) {
-    const normalized = episodes.map((ep, index) => ({
-      ...ep,
-      ep: String(ep.ep_num || index + 1),
-    }));
-    const filtered = await filterEpisodesByPlayable(
-      upstream,
-      id,
-      normalized,
-      vod.title || "",
-      env
-    );
-    episodes.length = 0;
-    episodes.push(...filtered);
-    if (!episodes.length) {
-      throw new UpstreamError(
-        upstream,
-        "no_playable",
-        `「${vod.title || id}」逐集检查后没有可播放的源`,
-        { status: 200, details: { id: String(id), episodes: normalized.length } }
-      );
-    }
   }
 
   const playUrls = episodes.map((ep, index) => {

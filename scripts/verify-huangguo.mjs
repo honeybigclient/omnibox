@@ -670,11 +670,11 @@ async function main() {
   await show("1. ac=upstreams（自动同步候选池）", path, result);
   expect(result.status === 200, "upstreams HTTP 200");
   expect(result.body.code === 1, "upstreams code 1");
-  // 原生 + 2 个 MacCMS + 3 条镜像线路（内置兜底线路）。
-  expect(result.body.count === 6, "should discover native + 2 MacCMS + 3 mirrors");
+  // 原生 + 2 个 MacCMS；镜像域名只用于接口换线，不再单独列成源。
+  expect(result.body.count === 3, "should discover native + 2 MacCMS");
   expect(
-    result.body.upstreams.filter((item) => item.kind === "huangguo-site").length === 3,
-    "mirror lines registered as huangguo-site"
+    result.body.upstreams.filter((item) => item.kind === "huangguo-site").length === 0,
+    "mirror domains are not exposed as standalone sources"
   );
   expect(result.body.defaultSlug === "huangguo-web", "default slug");
   expect(result.body.upstreams.every((item) => item.status === "unknown"), "initial status");
@@ -683,14 +683,8 @@ async function main() {
   path = "/huangguo/api.php/provide/vod/?ac=upstreams&probe=1";
   result = await call(path);
   await show("2. ac=upstreams&probe=1（主动健康检查）", path, result);
-  // 内置镜像线路在 mock 里不可达，所以只要求原来那 3 个上游探测成功。
-  expect(result.body.probe.ok >= 3, "original upstreams probed ok");
-  expect(
-    result.body.upstreams
-      .filter((item) => item.kind !== "huangguo-site")
-      .every((item) => item.status === "ok"),
-    "probe marks ok for JSON upstreams"
-  );
+  expect(result.body.probe.ok === 3, "all 3 probes ok");
+  expect(result.body.upstreams.every((item) => item.status === "ok"), "probe marks ok");
 
   // 3. ac=list：保持原有黄果分类。
   path = "/huangguo/api.php/provide/vod/?ac=list";
