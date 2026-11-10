@@ -1614,7 +1614,7 @@ async function lookupTitle(upstream, id, env) {
       upstream,
       `${upstream.api}/api/detail/${encodeURIComponent(id)}`,
       env,
-      { timeoutMs: 5000 }
+      { timeoutMs: 2500, silent: true }
     );
     const item = (Array.isArray(data.list) && data.list[0]) || null;
     return item ? String(item.vod_name || "").trim() : "";
@@ -1691,6 +1691,23 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
   const remaining = (max) =>
     Math.max(1000, Math.min(max || 25000, deadline - Date.now()));
   const attempts = [];
+  // 最快的路：POST /playback 直接取址（2026-11 起的官方方式），成功就不用下面那些兜底了。
+  try {
+    const playback = await sitePlayback(upstream, id, ep, env);
+    if (isHttpUrl(playback.url)) {
+      attempts.push({ step: "site-playback", ok: true, status: playback.status });
+      return { url: playback.url, attempts, preferDirect: true };
+    }
+    attempts.push({
+      step: "site-playback",
+      ok: false,
+      status: playback.status,
+      reason: "streams.main 为空",
+    });
+  } catch (error) {
+    attempts.push({ step: "site-playback", ok: false, ...playAttemptError(error) });
+  }
+
   const archives = String(id).startsWith("archives_");
   const pid = archives ? String(id).slice("archives_".length) : "";
   let detailPageUrl = isHttpUrl(pageHint) ? String(pageHint).trim() : "";
@@ -1853,7 +1870,7 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
     attempts.push({ step: "worker-play", ok: false, ...playAttemptError(error) });
   }
 
-  // 源站官方播放接口。老剧有时要求先有会话 cookie，先裸请求、失败再预热 cookie 重试。
+  // 2) 旧接口兜底（部分老剧还有效）。老剧有时要求先有会话 cookie，先裸请求、失败再预热 cookie 重试。
   const sitePlayUrl = `${upstream.site}/api/videos/${encodeURIComponent(
     id
   )}/play?ep=${encodeURIComponent(ep)}`;
@@ -3666,7 +3683,7 @@ async function handlePlay(url, pool, env) {
       code: 0,
       msg: pending
         ? `该剧刚更新，上游还没生成播放地址，过几小时再试（已尝试 ${tried.length} 个上游）`
-        : systemic
+        : systemic && lastError
           ? errorMessage(lastError)
           : `上游没有返回可播放地址（已尝试 ${tried.length} 个上游）`,
       kind: pending ? "media_pending" : systemic ? systemic.kind : "no_playable",
@@ -3736,43 +3753,23 @@ async function handlePlayCheck(url, pool, env) {
 
   const rows = await mapLimit(items, 3, async (item) => {
     if (!item.id) return { ...item, ok: false, reason: "缺少 id" };
-    const target = `${upstream.site}/api/videos/${encodeURIComponent(
-      item.id
-    )}/play?ep=${encodeURIComponent(ep)}`;
     const started = Date.now();
     try {
-      const response = await fetchWithTimeout(
-        target,
-        {
-          headers: {
-            "User-Agent": UA,
-            Referer: `${upstream.site}/video/${encodeURIComponent(item.id)}/`,
-            Accept: "application/json, text/plain, */*",
-          },
-        },
-        7000
-      );
-      const text = await response.text();
-      let parsed = null;
-      try {
-        parsed = JSON.parse(text);
-      } catch {
-        parsed = null;
-      }
-      const data = (parsed && parsed.data) || {};
-      const hasVideo = !!(data.video_url || data.video_url_hevc);
+      const playback = await sitePlayback(upstream, item.id, ep, env);
+      const data = playback.payload || {};
+      const hasVideo = isHttpUrl(playback.url);
       return {
         id: item.id,
         name: item.name,
-        status: response.status,
+        status: playback.status,
         ms: Date.now() - started,
-        msg: (parsed && parsed.msg) || "",
+        msg: "",
         duration: data.duration == null ? null : Number(data.duration),
-        hasVideoUrl: !!data.video_url,
-        hasHevc: !!data.video_url_hevc,
-        mediaId: data.media_id || "",
+        hasVideoUrl: hasVideo,
+        hasHevc: !!(data.streams && data.streams.hevc),
+        mediaId: "",
         ok: hasVideo,
-        ...(hasVideo ? {} : { reason: "没有 video_url" }),
+        ...(hasVideo ? {} : { reason: "playback 没有返回 streams.main" }),
       };
     } catch (error) {
       return {
@@ -3951,6 +3948,59 @@ async function siteSearch(upstream, keyword, origin, env) {
 }
 
 /**
+ * 站点 2026-11 起把"取播放地址"从 GET /api/videos/{id}/play 换成了
+ *   POST /api/videos/{id}/episodes/{ep}/playback
+ * 返回 { streams: { main, hevc, preview }, cdn: {...} }。老的 GET 接口现在
+ * 仍然 200，但 media 字段一律为空——之前"N 集都播不出来"就是这个原因。
+ * 返回的 m3u8 本身带 ACAO:*，不需要额外鉴权头，浏览器可以直连。
+ */
+async function sitePlayback(upstream, id, ep, env) {
+  const pageUrl = `${upstream.site}/video/${encodeURIComponent(
+    id
+  )}/ep-${encodeURIComponent(ep)}/`;
+  const target = `${upstream.site}/api/videos/${encodeURIComponent(
+    id
+  )}/episodes/${encodeURIComponent(ep)}/playback`;
+  const started = Date.now();
+  const response = await fetchWithTimeout(
+    target,
+    {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/plain, */*",
+        Referer: pageUrl,
+        Origin: upstream.site,
+      },
+      body: "{}",
+    },
+    9000
+  );
+  if (!response.ok) {
+    throw new UpstreamError(upstream, "http", `HTTP ${response.status}`, {
+      status: response.status,
+      ms: Date.now() - started,
+    });
+  }
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new UpstreamError(upstream, "parse", "响应不是有效 JSON", {
+      status: response.status,
+      ms: Date.now() - started,
+    });
+  }
+  const payload = (data && data.data) || {};
+  const streams = payload.streams || {};
+  const url = String(streams.main || streams.hevc || "").trim();
+  markSuccess(upstream, Date.now() - started);
+  return { url: isHttpUrl(url) ? url : "", payload, status: response.status };
+}
+
+/**
  * 镜像站列表：/api/videos?category=&sort=&page=&size=
  * 榜单接口（/api/ranks）返回的项目没有 id，没法跳详情，所以榜单也走
  * /api/videos?sort=hot，保证每项都能点进去。
@@ -4032,6 +4082,22 @@ async function siteDetail(upstream, id, origin, env) {
 /** 镜像站单集解析：站内接口 → 剧集页兜底。 */
 async function resolveSitePlay(upstream, id, ep, env, pageHint) {
   const attempts = [];
+  try {
+    const playback = await sitePlayback(upstream, id, ep, env);
+    if (isHttpUrl(playback.url)) {
+      attempts.push({ step: "site-playback", ok: true, status: playback.status });
+      return { url: playback.url, attempts, preferDirect: true };
+    }
+    attempts.push({
+      step: "site-playback",
+      ok: false,
+      status: playback.status,
+      reason: "streams.main 为空",
+    });
+  } catch (error) {
+    attempts.push({ step: "site-playback", ok: false, ...playAttemptError(error) });
+  }
+
   try {
     const { data, status } = await requestUpstreamJson(
       upstream,
@@ -4330,6 +4396,34 @@ async function handlePlayDebug(url, pool, env) {
   const pageUrl = isHttpUrl(pageHint)
     ? pageHint
     : `${upstream.site}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`;
+
+  if (upstream.kind === "huangguo" || upstream.kind === "huangguo-site") {
+    const playbackUrl = `${upstream.site}/api/videos/${encodeURIComponent(
+      id
+    )}/episodes/${encodeURIComponent(ep)}/playback`;
+    const started = Date.now();
+    try {
+      const playback = await sitePlayback(upstream, id, ep, env);
+      steps.push({
+        step: "site-playback",
+        target: playbackUrl,
+        method: "POST",
+        status: playback.status,
+        ms: Date.now() - started,
+        foundMedia: playback.url,
+        streams: playback.payload && playback.payload.streams,
+        cdn: playback.payload && playback.payload.cdn,
+      });
+    } catch (error) {
+      steps.push({
+        step: "site-playback",
+        target: playbackUrl,
+        method: "POST",
+        ms: Date.now() - started,
+        error: playAttemptError(error),
+      });
+    }
+  }
 
   if (upstream.kind === "huangguo") {
     await probe(
