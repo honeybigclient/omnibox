@@ -184,6 +184,18 @@ const nativePendingDetail = {
   ],
 };
 
+// 老剧需要先拿会话 cookie 才肯给播放地址。
+const nativeCookieDetail = {
+  list: [
+    {
+      vod_id: 13300,
+      vod_name: "老剧 Cookie 测试",
+      vod_pic: "https://img.test/cover.jpg",
+      episodes: [{ ep: 1, title: "第1集", url: "https://site.test/video/13300/ep-1/" }],
+    },
+  ],
+};
+
 // 详情存在但 episodes 为空：应明确报 no_playable，而不是“没有找到内容”。
 const nativeEmptyDetail = {
   list: [
@@ -330,6 +342,15 @@ globalThis.fetch = async (input, init = {}) => {
   }
 
   if (parsed.hostname === "site.test") {
+    if (parsed.pathname === "/video/13300/") {
+      return new Response("<html>player</html>", {
+        status: 200,
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Set-Cookie": "hg_session=abc123; Path=/; HttpOnly",
+        },
+      });
+    }
     if (parsed.pathname === "/video/12700/ep-2/") {
       return new Response(
         '<script id="videoInitialData">{"epPlaySrcs":{"2":"https:\\/\\/cdn.test\\/from-page.m3u8"}}</script>',
@@ -340,6 +361,15 @@ globalThis.fetch = async (input, init = {}) => {
       // 13200 模拟"有 duration、没有 video_url"的新更新剧集。
       if (parsed.pathname.includes("13200")) {
         return json({ data: { duration: 360, video_url: "" } });
+      }
+      // 13300 模拟老剧：没有会话 cookie 就不给地址。
+      if (parsed.pathname.includes("13300")) {
+        const cookie = String((init.headers && init.headers.Cookie) || "");
+        return json({
+          data: {
+            video_url: cookie.includes("hg_session") ? "https://cdn.test/cookie.m3u8" : "",
+          },
+        });
       }
       return json({ data: { video_url: "" } });
     }
@@ -364,6 +394,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (parsed.pathname === "/api/detail/13000") return json(nativeFailoverDetail);
     if (parsed.pathname === "/api/detail/13100") return json(nativeDeepDetail);
     if (parsed.pathname === "/api/detail/13200") return json(nativePendingDetail);
+    if (parsed.pathname === "/api/detail/13300") return json(nativeCookieDetail);
     if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
     if (parsed.pathname === "/api/play") {
       const target = String(parsed.searchParams.get("url") || "");
@@ -371,7 +402,8 @@ globalThis.fetch = async (input, init = {}) => {
         target.includes("12700") ||
         target.includes("12800") ||
         target.includes("13000") ||
-        target.includes("13200")
+        target.includes("13200") ||
+        target.includes("13300")
       ) {
         return json({ url: "", proxy: "" });
       }
@@ -892,6 +924,18 @@ async function main() {
   await show("6v. 空 key/分片", path, result);
   expect(result.status === 502, "empty body 502");
   expect(String(result.body.error || "").includes("空内容"), "empty body error msg");
+
+  // 6w. 老剧需要会话 cookie：预热后重试接口要能拿到地址。
+  path =
+    "/huangguo/play.m3u8?up=huangguo-web&id=13300&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/13300/ep-1/");
+  result = await call(path);
+  await show("6w. cookie 预热后拿到播放地址", path, result);
+  expect(result.status === 302, "cookie retry 302");
+  expect(
+    result.response.headers.get("location") === "https://cdn.test/cookie.m3u8",
+    "cookie retry location"
+  );
 
   // 7. MacCMS 上游按 slug 路由 + ac=list。
   path = "/huangguo/api.php/provide/vod/?ac=list&slug=alpha";

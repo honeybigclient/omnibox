@@ -995,6 +995,7 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
           "User-Agent": UA,
           Referer: refererOf(upstream),
           Accept: "application/json, text/plain, */*",
+          ...(options.headers || {}),
         },
       },
       timeoutMs
@@ -1362,6 +1363,42 @@ async function fetchPageStream(upstream, pageUrl, ep, timeoutMs) {
  * no_playable。详情阶段改为生成 /huangguo/play.m3u8?... 的惰性地址，
  * 点哪集解析哪集；解析顺序：Worker /api/play → 源站官方接口 → 页面兜底。
  */
+/**
+ * 有些剧集要先访问一次剧集页拿到会话 cookie，接口才肯给播放地址
+ * （老剧尤其明显）。这里先抓一次页面、留下 set-cookie，再带 cookie 请求接口。
+ */
+async function warmupSiteCookies(upstream, id, env) {
+  try {
+    const response = await fetchWithTimeout(
+      `${upstream.site}/video/${encodeURIComponent(id)}/`,
+      {
+        headers: {
+          "User-Agent": UA,
+          Referer: `${upstream.site}/`,
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "zh-CN,zh;q=0.9",
+        },
+      },
+      6000
+    );
+    const raw =
+      typeof response.headers.getSetCookie === "function"
+        ? response.headers.getSetCookie()
+        : response.headers.get("set-cookie")
+          ? [response.headers.get("set-cookie")]
+          : [];
+    // 读掉响应体，避免连接悬挂。
+    await response.text().catch(() => "");
+    return raw
+      .map((item) => String(item || "").split(";")[0].trim())
+      .filter(Boolean)
+      .join("; ");
+  } catch {
+    return "";
+  }
+}
+
 function playAttemptError(error) {
   if (error instanceof UpstreamError) {
     return {
@@ -1556,51 +1593,90 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
     attempts.push({ step: "worker-play", ok: false, ...playAttemptError(error) });
   }
 
-  // 源站官方播放接口。
+  // 源站官方播放接口。老剧有时要求先有会话 cookie，先裸请求、失败再预热 cookie 重试。
+  const sitePlayUrl = `${upstream.site}/api/videos/${encodeURIComponent(
+    id
+  )}/play?ep=${encodeURIComponent(ep)}`;
+
+  const trySitePlay = async (cookies, label) => {
+    const started = Date.now();
+    try {
+      const { data, status } = await requestUpstreamJson(upstream, sitePlayUrl, env, {
+        timeoutMs: remaining(5000),
+        headers: cookies ? { Cookie: cookies } : undefined,
+      });
+      const siteUrl = String(
+        (data.data && data.data.video_url) || data.video_url || ""
+      ).trim();
+      const deep = siteUrl ? "" : deepFindMediaUrl(data);
+      const ms = Date.now() - started;
+      if (isHttpUrl(siteUrl) || deep) {
+        attempts.push({
+          step: label,
+          ok: true,
+          status,
+          ms,
+          ...(deep ? { via: "deep" } : {}),
+        });
+        return { url: siteUrl || deep, attempts, preferDirect: true };
+      }
+      const detailData = (data && data.data) || null;
+      const duration = Number((detailData && detailData.duration) || 0);
+      attempts.push({
+        step: label,
+        ok: false,
+        status,
+        ms,
+        // 有 duration、没有 video_url：上游更新了剧集但片源还没生成好。
+        ...(duration > 0
+          ? {
+              kind: "media_pending",
+              reason: "上游返回了时长但没有播放地址（可能刚更新）",
+              duration,
+            }
+          : { reason: "empty video_url" }),
+        ...(data && typeof data === "object"
+          ? { keys: Object.keys(data).slice(0, 8) }
+          : {}),
+      });
+    } catch (error) {
+      attempts.push({ step: label, ok: false, ...playAttemptError(error) });
+    }
+    return null;
+  };
+
+  const bareSite = await trySitePlay("", "site-play");
+  if (bareSite) return bareSite;
+
+  const cookies = await warmupSiteCookies(upstream, id, env);
+  if (cookies) {
+    const withCookie = await trySitePlay(cookies, "site-play-cookie");
+    if (withCookie) return withCookie;
+  }
+
+  // 再退一步：详情接口里偶尔藏着 media_id / video_api，交给深度搜索。
   try {
     const started = Date.now();
     const { data, status } = await requestUpstreamJson(
       upstream,
-      `${upstream.site}/api/videos/${encodeURIComponent(id)}/play?ep=${encodeURIComponent(ep)}`,
+      `${upstream.site}/api/videos/${encodeURIComponent(id)}`,
       env,
-      { timeoutMs: remaining(5000) }
+      {
+        timeoutMs: remaining(5000),
+        headers: cookies ? { Cookie: cookies } : undefined,
+      }
     );
-    const siteUrl = String(
-      (data.data && data.data.video_url) || data.video_url || ""
-    ).trim();
-    const deepSite = siteUrl ? "" : deepFindMediaUrl(data);
-    const ms = Date.now() - started;
-    if (isHttpUrl(siteUrl) || deepSite) {
-      attempts.push({
-        step: "site-play",
-        ok: true,
-        status,
-        ms,
-        ...(deepSite ? { via: "deep" } : {}),
-      });
-      return { url: siteUrl || deepSite, attempts, preferDirect: true };
-    }
-    const detailData = (data && data.data) || null;
-    const duration = Number((detailData && detailData.duration) || 0);
+    const deepVideo = deepFindMediaUrl(data);
     attempts.push({
-      step: "site-play",
-      ok: false,
+      step: "site-video",
+      ok: !!deepVideo,
       status,
-      ms,
-      // 有 duration、没有 video_url：上游更新了剧集但片源还没生成好。
-      ...(duration > 0
-        ? {
-            kind: "media_pending",
-            reason: "上游返回了时长但没有播放地址（可能刚更新）",
-            duration,
-          }
-        : { reason: "empty video_url" }),
-      ...(data && typeof data === "object"
-        ? { keys: Object.keys(data).slice(0, 8) }
-        : {}),
+      ms: Date.now() - started,
+      ...(deepVideo ? {} : { reason: "no media field" }),
     });
+    if (deepVideo) return { url: deepVideo, attempts, preferDirect: true };
   } catch (error) {
-    attempts.push({ step: "site-play", ok: false, ...playAttemptError(error) });
+    attempts.push({ step: "site-video", ok: false, ...playAttemptError(error) });
   }
 
   // 最后一层：抓剧集页。优先用详情里的精确 ep.url，再退回拼 URL。
