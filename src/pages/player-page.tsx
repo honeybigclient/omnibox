@@ -560,6 +560,27 @@ function PlayerPage() {
                 lastProgressAt = Date.now();
               });
 
+              // 清单拉不下来时，适配层通常返回的是 502 JSON，把里面的 msg 读出来，
+              // 这样用户看到的是"该剧暂无片源"而不是干巴巴的 manifestLoadError。
+              const readManifestError = async () => {
+                try {
+                  const response = await Promise.race([
+                    fetch(finalUrl, { cache: "no-store" }),
+                    new Promise<never>((_, reject) =>
+                      setTimeout(() => reject(new Error("timeout")), 3000)
+                    ),
+                  ]);
+                  const text = await response.text();
+                  const parsed = JSON.parse(text);
+                  if (parsed && typeof parsed.msg === "string" && parsed.msg) {
+                    return parsed.msg;
+                  }
+                } catch {
+                  // 不是 JSON 或者取不到，就用兜底文案。
+                }
+                return "无法加载播放列表";
+              };
+
               hls.on(Hls.Events.ERROR, (_event, data) => {
                 if (!data.fatal) return;
                 // 解码类错误先原地恢复一次，还不行再切源。
@@ -578,7 +599,14 @@ function PlayerPage() {
                 } catch {
                   // 已经销毁过。
                 }
-                failoverRef.current(`${data.type}/${data.details}`);
+                const fallback = `${data.type}/${data.details}`;
+                if (String(data.details || "").includes("manifest")) {
+                  void readManifestError().then((reason) =>
+                    failoverRef.current(reason || fallback)
+                  );
+                } else {
+                  failoverRef.current(fallback);
+                }
               });
 
               hls.loadSource(finalUrl);
@@ -843,14 +871,15 @@ function PlayerPage() {
       const next = availableSources.find((site) => !state.tried.has(site.key));
       if (!next) {
         if (playerRef.current) {
-          playerRef.current.notice.show = `播放失败（${reason}），没有其他可用源`;
+          playerRef.current.notice.show = `播放失败：${String(reason).slice(0, 80)}`;
         }
         return;
       }
 
       state.busy = true;
       if (playerRef.current) {
-        playerRef.current.notice.show = `播放失败（${reason}），正在切换到「${next.name}」`;
+        const short = String(reason).slice(0, 60);
+        playerRef.current.notice.show = `播放失败（${short}），正在切换到「${next.name}」`;
       }
       void switchSourceRef.current(next.key).finally(() => {
         state.busy = false;

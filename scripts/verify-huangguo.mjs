@@ -160,6 +160,18 @@ const nativeFailoverDetail = {
   ],
 };
 
+// 上游把播放地址塞进嵌套字段（data.play_url）：深度搜索也要认出来。
+const nativeDeepDetail = {
+  list: [
+    {
+      vod_id: 13100,
+      vod_name: "深层字段测试",
+      vod_pic: "https://img.test/cover.jpg",
+      episodes: [{ ep: 1, title: "第1集", url: "https://site.test/video/13100/ep-1/" }],
+    },
+  ],
+};
+
 // 详情存在但 episodes 为空：应明确报 no_playable，而不是“没有找到内容”。
 const nativeEmptyDetail = {
   list: [
@@ -313,11 +325,16 @@ globalThis.fetch = async (input, init = {}) => {
     if (parsed.pathname === "/api/detail/12800") return json(nativeNoMediaDetail);
     if (parsed.pathname === "/api/detail/12900") return json(nativeWorkerPageBugDetail);
     if (parsed.pathname === "/api/detail/13000") return json(nativeFailoverDetail);
+    if (parsed.pathname === "/api/detail/13100") return json(nativeDeepDetail);
     if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
     if (parsed.pathname === "/api/play") {
       const target = String(parsed.searchParams.get("url") || "");
       if (target.includes("12700") || target.includes("12800") || target.includes("13000")) {
         return json({ url: "", proxy: "" });
+      }
+      // 模拟字段改名：地址藏在 data.play_url 里。
+      if (target.includes("13100")) {
+        return json({ data: { play_url: "https://cdn.test/deep.m3u8" } });
       }
       // 只传数字 id 时模拟 Worker 页面兜底失败；传真实剧集页地址时成功。
       if (target === "12900") return json({ url: "", proxy: "" });
@@ -706,6 +723,46 @@ async function main() {
   const candidates = result.body.list[0].upstream_candidates;
   expect(Array.isArray(candidates) && candidates.length >= 2, "detail candidates");
   expect(candidates[0].slug === "huangguo-web", "candidate prefers requested upstream");
+
+  // 6n. 上游字段改名（data.play_url）时，深度搜索要能捞出来。
+  path =
+    "/huangguo/play.m3u8?up=huangguo-web&id=13100&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/13100/ep-1/");
+  result = await call(path);
+  await show("6n. 嵌套字段里的播放地址", path, result);
+  expect(result.status === 302, "deep url 302");
+  expect(
+    proxiedSrc(result) === "https://cdn.test/deep.m3u8",
+    "deep url extracted"
+  );
+
+  // 6o. playdebug：把每一步上游原始返回打出来。
+  path =
+    "/huangguo/api.php/provide/vod/?ac=playdebug&up=huangguo-web&id=13100&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/13100/ep-1/");
+  result = await call(path);
+  await show("6o. 播放解析诊断", path, result);
+  expect(result.body.code === 1, "playdebug code");
+  expect(Array.isArray(result.body.steps) && result.body.steps.length >= 3, "playdebug steps");
+  expect(
+    result.body.steps.some((item) => item.foundMedia === "https://cdn.test/deep.m3u8"),
+    "playdebug found media"
+  );
+  expect(result.body.resolved.url === "https://cdn.test/deep.m3u8", "playdebug resolved");
+
+  // 6p. playprobe：多种请求姿势都要有逐步结果，方便判断是不是被反爬挡了。
+  path = "/huangguo/api.php/provide/vod/?ac=playprobe&up=huangguo-web&id=13000&ep=1&title=" + encodeURIComponent("测试短剧 Alpha");
+  result = await call(path);
+  await show("6p. 多姿势播放探测", path, result);
+  expect(result.body.code === 1, "playprobe code");
+  expect(
+    Array.isArray(result.body.steps) && result.body.steps.length >= 4,
+    "playprobe steps"
+  );
+  expect(
+    result.body.steps.some((item) => item.label === "baseline"),
+    "playprobe baseline"
+  );
 
   // 7. MacCMS 上游按 slug 路由 + ac=list。
   path = "/huangguo/api.php/provide/vod/?ac=list&slug=alpha";

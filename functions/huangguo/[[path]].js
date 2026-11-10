@@ -12,6 +12,7 @@
  *                                                       key/分片透传，兜住 CORS)
  *   /huangguo/m3u8?src=...                             (同 hls，保留旧链接)
  *   /huangguo/api.php/provide/vod/?ac=playdebug         (播放解析诊断)
+ *   /huangguo/api.php/provide/vod/?ac=playprobe         (多种请求姿势探测)
  *
  * 播放入口 /huangguo/play.m3u8 不再 302 裸地址，而是 302 到 /huangguo/hls，
  * 由 Worker 代理取流；这是修复"一直转圈"的关键。解析失败时会按健康度
@@ -3115,6 +3116,178 @@ async function handlePlay(url, pool, env) {
 }
 
 /**
+ * 播放探测：一次性试多种请求姿势（浏览器头、Origin、ep=0、带 cookie 等），
+ * 用来确认上游到底是"字段改名"还是"把机房 IP 当爬虫挡了"。
+ *
+ *   /huangguo/api.php/provide/vod/?ac=playprobe&up=huangguo-web&id=12612&ep=1
+ */
+const BROWSER_HEADERS = {
+  Accept:
+    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+  "Cache-Control": "no-cache",
+  Pragma: "no-cache",
+  "sec-ch-ua": '"Chromium";v="120", "Not(A:Brand";v="24"',
+  "sec-ch-ua-mobile": "?0",
+  "sec-ch-ua-platform": '"Windows"',
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Upgrade-Insecure-Requests": "1",
+};
+
+async function handlePlayProbe(url, pool, env) {
+  const id = String(url.searchParams.get("id") || "").trim();
+  const ep = String(url.searchParams.get("ep") || "1").trim() || "1";
+  const slug = String(url.searchParams.get("up") || "").trim();
+  const title = String(url.searchParams.get("title") || "").trim();
+
+  const upstream = upstreamBySlug(pool, slug);
+  if (!upstream) {
+    return jsonResponse({ code: 0, msg: `未知上游: ${slug || "(空)"}` }, 404);
+  }
+  if (!id) return jsonResponse({ code: 0, msg: "缺少 id" }, 400);
+
+  const pageUrl = `${upstream.site}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(
+    ep
+  )}/`;
+  const homeUrl = `${upstream.site}/`;
+  const steps = [];
+
+  const attempt = async (label, target, headers) => {
+    const started = Date.now();
+    try {
+      const response = await fetchWithTimeout(
+        target,
+        { headers: { "User-Agent": UA, ...headers } },
+        9000
+      );
+      const text = await response.text();
+      let parsed = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        parsed = null;
+      }
+      steps.push({
+        label,
+        target,
+        status: response.status,
+        ms: Date.now() - started,
+        contentType: response.headers.get("content-type") || "",
+        setCookie: (response.headers.get("set-cookie") || "").slice(0, 160) || null,
+        keys: parsed && typeof parsed === "object" ? Object.keys(parsed).slice(0, 10) : null,
+        mediaFields: parsed && parsed.data
+          ? Object.fromEntries(
+              Object.entries(parsed.data).filter(([key, value]) =>
+                /url|key|iv|api|media/i.test(key) && typeof value === "string"
+              )
+            )
+          : null,
+        foundMedia: deepFindMediaUrl(parsed || text),
+        playLinks: (String(text).match(/\/(?:detail|play)\/[A-Za-z0-9_-]+/g) || []).length,
+        body: (parsed ? JSON.stringify(parsed) : text).slice(0, 400),
+      });
+      return { response, text, parsed };
+    } catch (error) {
+      steps.push({
+        label,
+        target,
+        ms: Date.now() - started,
+        error: String((error && error.message) || error).slice(0, 160),
+      });
+      return null;
+    }
+  };
+
+  const apiBase = `${upstream.site}/api/videos/${encodeURIComponent(id)}`;
+
+  // 1) 基线：和现在线上一样的请求
+  await attempt("baseline", `${apiBase}/play?ep=${encodeURIComponent(ep)}`, {
+    Referer: `${upstream.site}/`,
+    Accept: "application/json, text/plain, */*",
+  });
+
+  // 2) 浏览器全套头 + Origin + XHR 标记
+  await attempt("browser-headers", `${apiBase}/play?ep=${encodeURIComponent(ep)}`, {
+    ...BROWSER_HEADERS,
+    Accept: "application/json, text/plain, */*",
+    Referer: pageUrl,
+    Origin: upstream.site,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "X-Requested-With": "XMLHttpRequest",
+  });
+
+  // 3) ep 从 0 开始
+  await attempt("ep-zero", `${apiBase}/play?ep=0`, {
+    ...BROWSER_HEADERS,
+    Referer: pageUrl,
+    Origin: upstream.site,
+  });
+
+  // 4) 带时间戳破缓存
+  await attempt(
+    "cache-bust",
+    `${apiBase}/play?ep=${encodeURIComponent(ep)}&_t=${Date.now()}`,
+    { ...BROWSER_HEADERS, Referer: pageUrl, Origin: upstream.site }
+  );
+
+  // 5) 详情接口（看有没有别的媒体字段）
+  await attempt("video-detail", apiBase, {
+    "User-Agent": UA,
+    Referer: pageUrl,
+    Accept: "application/json, text/plain, */*",
+  });
+
+  // 6) 用浏览器头抓剧集页，看真实播放器 HTML 里有没有 m3u8
+  const pageAttempt = await attempt("page-browser", pageUrl, {
+    ...BROWSER_HEADERS,
+    Referer: homeUrl,
+  });
+
+  // 7) 如果页面给了 cookie，带 cookie 再问一次接口
+  const cookie = pageAttempt && pageAttempt.response
+    ? (pageAttempt.response.headers.get("set-cookie") || "").split(",")[0].slice(0, 200)
+    : "";
+  if (cookie) {
+    await attempt(
+      "api-with-cookie",
+      `${apiBase}/play?ep=${encodeURIComponent(ep)}`,
+      {
+        ...BROWSER_HEADERS,
+        Referer: pageUrl,
+        Origin: upstream.site,
+        Cookie: cookie,
+        Accept: "application/json, text/plain, */*",
+      }
+    );
+  }
+
+  // 8) 新站按剧名搜，看有没有这部
+  if (title) {
+    await attempt(
+      "me-search-browser",
+      `${HUANGGUO_ME}/search/?q=${encodeURIComponent(title)}`,
+      { ...BROWSER_HEADERS, Referer: `${HUANGGUO_ME}/` }
+    );
+  }
+
+  return jsonResponse({
+    code: 1,
+    msg: "播放探测",
+    upstream: { slug: upstream.slug, api: upstream.api, site: upstream.site },
+    id,
+    ep,
+    title,
+    pageUrl,
+    cookie: cookie || null,
+    steps,
+  });
+}
+
+/**
  * 播放诊断：把解析每一步的上游原始返回打出来（含 HTTP 状态、耗时、JSON 键名、
  * 抓到的媒体地址、正文前 1200 字符）。排查"上游有片却解析不到"时用它。
  *
@@ -3295,6 +3468,10 @@ export async function onRequest(context) {
 
   if (ac === "playdebug") {
     return handlePlayDebug(url, pool, env);
+  }
+
+  if (ac === "playprobe") {
+    return handlePlayProbe(url, pool, env);
   }
 
   if (isPlay) {
