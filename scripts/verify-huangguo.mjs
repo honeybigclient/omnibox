@@ -17,6 +17,19 @@ import { onRequest } from "../functions/huangguo/[[path]].js";
 const COVER_KEY = "f5d965df75336270";
 const COVER_IV = "97b60394abc2fbe1";
 
+// 与适配层 DEFAULT_PROXY_SECRET 一致：代理地址现在要签名，测试里手动补上。
+const PROXY_SECRET = "omnibox-huangguo-proxy-v1";
+
+function signProxySrc(src) {
+  return crypto
+    .createHmac("sha256", PROXY_SECRET)
+    .update(src)
+    .digest("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .slice(0, 16);
+}
+
 function encryptedCover() {
   const png = Buffer.from([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5, 6,
@@ -841,11 +854,14 @@ async function main() {
   );
 
   // 6k. 播放代理：m3u8 改写 + key/分片按 CORS 能力直连或代理。
+  const hlsSrc = "https://cdn.test/play.m3u8";
   const hlsPath =
     "/huangguo/hls?src=" +
-    encodeURIComponent("https://cdn.test/play.m3u8") +
+    encodeURIComponent(hlsSrc) +
     "&ref=" +
-    encodeURIComponent("https://site.test/");
+    encodeURIComponent("https://site.test/") +
+    "&sig=" +
+    signProxySrc(hlsSrc);
   result = await call(hlsPath);
   await show("6k. 播放代理改写 m3u8", hlsPath, result);
   expect(result.status === 200, "hls 200");
@@ -876,6 +892,33 @@ async function main() {
     playlist.includes("/huangguo/hls?src=https%3A%2F%2Fcdn.test%2Faudio.m3u8"),
     "nested playlist proxied"
   );
+
+  // 6k2. 没有签名的代理地址一律拒绝，防止被当成开放代理刷流量。
+  result = await call(
+    "/huangguo/hls?src=" + encodeURIComponent("https://cdn.test/play.m3u8")
+  );
+  await show("6k2. 无签名代理", "/huangguo/hls?src=…", result);
+  expect(result.status === 403, "unsigned hls 403");
+
+  // 6k3. 已登录用户可以把任意地址换成带签名的代理地址（浏览器解析出的地址用）。
+  result = await call(
+    "/huangguo/?ac=signproxy&src=" + encodeURIComponent("https://cdn.test/play.m3u8")
+  );
+  await show("6k3. 生成签名代理地址", "/huangguo/?ac=signproxy&src=…", result);
+  expect(result.status === 200 && result.body.code === 1, "signproxy code");
+  expect(String(result.body.url).includes("&sig="), "signproxy adds sig");
+  const signedPath = new URL(String(result.body.url)).pathname +
+    `?${new URL(String(result.body.url)).searchParams.toString()}`;
+  result = await call(signedPath);
+  await show("6k4. 签名地址可用", signedPath, result);
+  expect(result.status === 200, "signed hls works");
+
+  // 6k5. 封面代理要求登录，匿名直接 401。
+  result = await call(
+    "/huangguo/media?src=" + encodeURIComponent("https://img.test/cover.jpg"),
+    { email: null }
+  );
+  expect(result.status === 401, "anonymous media 401");
 
   // 6l. 旧站彻底失败时，按剧名自动切到有同名剧的上游。
   // 6l. 默认不跨站：同一部剧在 alpha 有，但黄果源里不该出现。
@@ -1006,7 +1049,11 @@ async function main() {
   );
 
   // 6v. key/分片返回 200 但空内容时，要明确报错，别让播放器无限转圈。
-  path = "/huangguo/hls?src=" + encodeURIComponent("https://cdn.test/empty.ts");
+  path =
+    "/huangguo/hls?src=" +
+    encodeURIComponent("https://cdn.test/empty.ts") +
+    "&sig=" +
+    signProxySrc("https://cdn.test/empty.ts");
   result = await call(path);
   await show("6v. 空 key/分片", path, result);
   expect(result.status === 502, "empty body 502");
@@ -1120,11 +1167,14 @@ async function main() {
   expect(result.body.msg.includes("episodes 为空"), "empty episodes concrete msg");
 
   // 11c. 新站 m3u8 代理：相对 key/分片必须改写成绝对地址。
+  const meSrc = "https://huangguo.me/h5/m3u8/test.m3u8";
   path =
     "/huangguo/m3u8?src=" +
-    encodeURIComponent("https://huangguo.me/h5/m3u8/test.m3u8") +
+    encodeURIComponent(meSrc) +
     "&ref=" +
-    encodeURIComponent("https://huangguo.me/play/qmnslgqb/29680/");
+    encodeURIComponent("https://huangguo.me/play/qmnslgqb/29680/") +
+    "&sig=" +
+    signProxySrc(meSrc);
   result = await call(path);
   await show("11c. 新站 m3u8 代理重写", path, result);
   expect(result.status === 200, "m3u8 proxy 200");

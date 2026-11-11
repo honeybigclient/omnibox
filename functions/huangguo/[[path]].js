@@ -2664,6 +2664,22 @@ async function handleDetail(url, pool, env) {
   }
 }
 
+/** 已登录用户把任意播放地址换成带签名的代理地址（给浏览器解析出的地址用）。 */
+async function handleSignProxy(url, request, env) {
+  if (!getEmail(request)) {
+    return jsonResponse({ error: "需要登录后访问" }, 401);
+  }
+  const src = String(url.searchParams.get("src") || "").trim();
+  if (!isHttpUrl(src)) {
+    return jsonResponse({ error: "缺少有效的播放地址" }, 400);
+  }
+  const ref = String(url.searchParams.get("ref") || "").trim();
+  return jsonResponse({
+    code: 1,
+    url: await streamProxyUrl(url.origin, src, isHttpUrl(ref) ? ref : "", env),
+  });
+}
+
 async function handleUpstreams(url, pool, env) {
   const probe =
     /^(1|true|all|yes)$/i.test(String(url.searchParams.get("probe") || ""));
@@ -2769,10 +2785,19 @@ function imageResponse(bytes, contentType) {
   });
 }
 
-async function handleMedia(url, pool) {
+async function handleMedia(url, request, pool) {
   const src = url.searchParams.get("src") || "";
   if (!isHttpUrl(src)) {
     return jsonResponse({ error: "缺少有效的图片地址" }, 400);
+  }
+
+  // 封面代理同样不能对匿名敞开（不然也能当免费图片代理用）。
+  if (!getEmail(request)) {
+    return jsonResponse({ error: "需要登录后访问" }, 401);
+  }
+  // 合理上限，防止有人拿大文件刷流量。
+  if (url.searchParams.get("big") !== "1" && src.length > 2048) {
+    return jsonResponse({ error: "地址过长" }, 400);
   }
 
   const slug = url.searchParams.get("up") || requestedSlug(url);
@@ -3205,9 +3230,73 @@ function isAllowedHuangguoMeHost(hostname) {
   );
 }
 
-function streamProxyUrl(origin, src, referer) {
+/**
+ * 代理地址签名。
+ *
+ * /huangguo/hls 和 /huangguo/media 本质上是"帮我取这个 URL"，不签名的话谁都能拿它
+ * 当免费代理刷流量。这里用 HMAC-SHA256(src) 给地址签个短签名：
+ *   - 只签地址本身，不签时间：一部剧要播几十分钟，分片是边播边取的，带过期会播一半断掉。
+ *   - 密钥来自环境变量 HUANGGUO_PROXY_SECRET；没配就用内置默认盐，退化成"弱签名"，
+ *     功能不受影响，只是防不住专门读代码的人。
+ */
+const DEFAULT_PROXY_SECRET = "omnibox-huangguo-proxy-v1";
+
+function proxySecret(env) {
+  const raw = String((env && env.HUANGGUO_PROXY_SECRET) || "").trim();
+  return raw || DEFAULT_PROXY_SECRET;
+}
+
+let proxyHmacKey = null;
+let proxyHmacKeySecret = "";
+
+async function proxyHmac(env) {
+  const secret = proxySecret(env);
+  if (!proxyHmacKey || proxyHmacKeySecret !== secret) {
+    proxyHmacKey = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"]
+    );
+    proxyHmacKeySecret = secret;
+  }
+  return proxyHmacKey;
+}
+
+/** 给一个 src 算出 16 位签名（base64url）。 */
+async function signProxySrc(src, env) {
+  const key = await proxyHmac(env);
+  const mac = new Uint8Array(
+    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(String(src)))
+  );
+  let binary = "";
+  for (const byte of mac) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").slice(0, 16);
+}
+
+/** 校验签名；管理邮箱（自己调试）可以免签。 */
+async function verifyProxySrc(url, request, env) {
+  const src = String(url.searchParams.get("src") || "").trim();
+  if (!isHttpUrl(src)) return false;
+  const email = getEmail(request);
+  if (email && adminEmails(env).includes(email)) return true;
+  const sig = String(url.searchParams.get("sig") || "").trim();
+  if (!sig) return false;
+  const expected = await signProxySrc(src, env);
+  // 定长比较，别用 === 提前返回。
+  if (sig.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < expected.length; i += 1) {
+    diff |= sig.charCodeAt(i) ^ expected.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+async function streamProxyUrl(origin, src, referer, env) {
   const params = new URLSearchParams({ src: String(src) });
   if (referer) params.set("ref", String(referer));
+  params.set("sig", await signProxySrc(String(src), env));
   return `${origin}/huangguo/hls?${params.toString()}`;
 }
 
@@ -3237,7 +3326,7 @@ function isPlaylistResponse(response, sourceUrl) {
  * 代理地址只接受 http(s) src，且不携带任何用户凭据，避免被当成开放代理滥用。
  */
 
-async function rewritePlaylist(text, sourceUrl, origin, referer) {
+async function rewritePlaylist(text, sourceUrl, origin, referer, env) {
   // 关键：ticket 是按"取清单的那个出口 IP"绑定的。清单既然是我们 Worker 取的，
   // 那 key / 分片也必须由我们 Worker 去取，否则浏览器拿着 Worker 的 ticket 会被
   // CDN 回一个 200 + 空 body（表现就是 hls.js 解不了密、无限转圈）。
@@ -3251,7 +3340,7 @@ async function rewritePlaylist(text, sourceUrl, origin, referer) {
     }
   };
 
-  const render = (raw) => {
+  const render = async (raw) => {
     const absUrl = absolutize(raw);
     if (!isHttpUrl(absUrl)) return absUrl;
     try {
@@ -3259,23 +3348,43 @@ async function rewritePlaylist(text, sourceUrl, origin, referer) {
     } catch {
       return absUrl;
     }
-    return streamProxyUrl(origin, absUrl, referer);
+    return streamProxyUrl(origin, absUrl, referer, env);
   };
 
-  return text
-    .split(/\r?\n/)
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return line;
-      if (trimmed.startsWith("#")) {
-        return line.replace(
-          /URI="([^"]+)"/g,
-          (match, uri) => `URI="${render(uri)}"`
-        );
-      }
-      return render(trimmed);
-    })
-    .join("\n");
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      out.push(line);
+      continue;
+    }
+    if (trimmed.startsWith("#")) {
+      out.push(
+        await replaceAsync(line, /URI="([^"]+)"/g, (match, uri) =>
+          render(uri)
+        )
+      );
+      continue;
+    }
+    out.push(await render(trimmed));
+  }
+  return out.join("\n");
+}
+
+/** String.replace 的异步版：回调可以返回 Promise。 */
+async function replaceAsync(input, pattern, replacer) {
+  const matches = [...input.matchAll(pattern)];
+  if (!matches.length) return input;
+  const parts = [];
+  let last = 0;
+  for (const match of matches) {
+    parts.push(input.slice(last, match.index));
+    parts.push(await replacer(...match));
+    last = match.index + match[0].length;
+  }
+  parts.push(input.slice(last));
+  return parts.join("");
 }
 
 async function handleStream(url, request, env) {
@@ -3284,6 +3393,11 @@ async function handleStream(url, request, env) {
 
   if (!isHttpUrl(src)) {
     return jsonResponse({ error: "缺少有效的播放地址" }, 400);
+  }
+
+  // 只允许播我们签过名的地址：不然这就是个任人使用的开放代理。
+  if (!(await verifyProxySrc(url, request, env))) {
+    return jsonResponse({ error: "地址签名无效，请重新点击剧集" }, 403);
   }
   let srcUrl;
   try {
@@ -3335,7 +3449,7 @@ async function handleStream(url, request, env) {
     if (!text.trimStart().startsWith("#EXTM3U")) {
       return jsonResponse({ error: "上游返回的不是 m3u8", src }, 502);
     }
-    const rewritten = await rewritePlaylist(text, src, url.origin, referer);
+    const rewritten = await rewritePlaylist(text, src, url.origin, referer, env);
     return new Response(rewritten, {
       headers: {
         ...CORS,
@@ -3394,9 +3508,12 @@ async function handleHuangguoMe(url, env) {
     title: result.title || title,
     stream: result.stream,
     playPage: result.playPage,
-    proxy: `${url.origin}/huangguo/m3u8?src=${encodeURIComponent(
-      result.stream
-    )}&ref=${encodeURIComponent(result.playPage || `${HUANGGUO_ME}/`)}`,
+    proxy: await streamProxyUrl(
+      url.origin,
+      result.stream,
+      result.playPage || `${HUANGGUO_ME}/`,
+      env
+    ),
     attempts: result.attempts,
     list: [],
   });
@@ -3713,7 +3830,7 @@ async function handlePlay(url, pool, env) {
           /^(1|true|yes)$/i.test(String(url.searchParams.get("proxy") || "")) ||
           result.preferDirect === false;
         const location = wantProxy
-          ? streamProxyUrl(url.origin, result.url, result.referer)
+          ? await streamProxyUrl(url.origin, result.url, result.referer, env)
           : result.url;
         attempts.push({
           step: `${candidate.slug}-route`,
@@ -4812,11 +4929,15 @@ export async function onRequest(context) {
   }
 
   if (isMedia) {
-    return handleMedia(url, pool);
+    return handleMedia(url, request, pool);
   }
 
   if (ac === "list") {
     return handleList(url, pool, env);
+  }
+
+  if (ac === "signproxy") {
+    return handleSignProxy(url, request, env);
   }
 
   if (ac === "upstreams") {

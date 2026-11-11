@@ -840,13 +840,26 @@ function PlayerPage() {
 
                   if (isManifest && stage === 2) {
                     // 浏览器解析到了地址，但清单本身跨域被拦 → 走代理再试。
+                    // 代理地址要签名（防盗用），签名得由适配层出。
                     stage = 3;
                     art.notice.show = "解析到地址，改走代理再试…";
-                    mount(
-                      `${window.location.origin}/huangguo/hls?src=${encodeURIComponent(
-                        target
-                      )}`
-                    );
+                    void (async () => {
+                      try {
+                        const res = await fetch(
+                          `${window.location.origin}/huangguo/?ac=signproxy&src=${encodeURIComponent(
+                            target
+                          )}`
+                        );
+                        const signed = await res.json();
+                        if (signed && signed.code === 1 && signed.url) {
+                          mount(String(signed.url));
+                          return;
+                        }
+                      } catch {
+                        // 签名失败就按失败处理。
+                      }
+                      finish(`${data.type}/${data.details}`);
+                    })();
                     return;
                   }
 
