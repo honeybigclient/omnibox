@@ -370,6 +370,10 @@ function PlayerPage() {
   // 换集时不该重建播放器（重建会丢全屏和倍速），只有剧/源/集列表/跳过设置变了才重建。
   const playerIdentity = `${vodId}|${sourceKey || ""}|${sortedEpisodes.length}|${skipStart}|${skipEnd}`;
   const playerIdentityRef = useRef(playerIdentity);
+  // 切集走 switchUrl 时，Artplayer 会重新执行 customType，但不会帮我们销毁上一次的
+  // Hls 实例。旧的实例还挂在同一个 video 上继续吐分片，就会出现"点了第二集却还在
+  // 放第一集"。这里统一在挂新实例前把旧的拆干净。
+  const hlsCleanupRef = useRef<(() => void) | null>(null);
   const needRecreateRef = useRef(true);
   const fullscreenTimerRef = useRef<number | null>(null);
   if (playerIdentityRef.current !== playerIdentity) {
@@ -384,7 +388,19 @@ function PlayerPage() {
         // 只是换了同一部剧的另一集：就地换源，播放器、全屏状态、倍速全都保留。
         needRecreateRef.current = false;
         if (existing.url !== currentSource) {
-          void existing.switchUrl(currentSource);
+          // 先把上一集的 Hls 停掉再换源，否则旧分片会继续喂给同一个 <video>，
+          // 表现就是"点了第二集还在放第一集"。
+          if (hlsCleanupRef.current) {
+            try {
+              hlsCleanupRef.current();
+            } catch {
+              // 已经清理过。
+            }
+            hlsCleanupRef.current = null;
+          }
+          void existing.switchUrl(currentSource).catch(() => {
+            failoverRef.current("切换剧集失败");
+          });
         }
         return;
       }
@@ -558,6 +574,16 @@ function PlayerPage() {
         ],
         customType: {
           m3u8: function playM3u8(video, url, art) {
+            // 换集时先把上一集残留的 Hls/看门狗拆掉，否则会继续播上一集。
+            if (hlsCleanupRef.current) {
+              try {
+                hlsCleanupRef.current();
+              } catch {
+                // 已经清理过。
+              }
+              hlsCleanupRef.current = null;
+            }
+
             const userProxy = localStorage.getItem("m3u8ProxySelected");
             const applyUserProxy = (target: string) =>
               userProxy ? `${userProxy}${target}` : target;
@@ -712,6 +738,15 @@ function PlayerPage() {
                 });
                 current = hls;
                 art.hls = hls;
+                hlsCleanupRef.current = () => {
+                  stopWatchdog();
+                  try {
+                    hls.destroy();
+                  } catch {
+                    // 已经销毁过。
+                  }
+                  if (current === hls) current = null;
+                };
 
                 let recovered = false;
                 let lastTime = 0;
@@ -790,12 +825,25 @@ function PlayerPage() {
                   finish(`${data.type}/${data.details}`);
                 });
 
+                // 同一个 <video> 复用时，旧的 MediaSource 会残留，先清干净。
+                try {
+                  video.pause();
+                  video.removeAttribute("src");
+                  video.load();
+                } catch {
+                  // 浏览器不支持也无所谓。
+                }
+
                 hls.loadSource(applyUserProxy(target));
                 hls.attachMedia(video);
               };
 
               mount(url);
               art.on("destroy", () => {
+                if (hlsCleanupRef.current) {
+                  hlsCleanupRef.current();
+                  hlsCleanupRef.current = null;
+                }
                 stopWatchdog();
                 if (current) {
                   try {
