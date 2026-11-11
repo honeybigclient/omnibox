@@ -2779,12 +2779,35 @@ async function handleMedia(url, pool) {
   const upstream = upstreamBySlug(pool, slug) || defaultUpstream(pool);
   const referer = upstream ? `${upstream.site || originOf(upstream.api)}/` : `${DEFAULT_SITE}/`;
 
+  // 相对路径（/media?url=...）挂在站点主机上，主站 403 时要换镜像去取。
+  const candidates = [src];
+  if (upstream) {
+    for (const base of siteBaseList(upstream)) {
+      const swapped = swapHost(src, base);
+      if (swapped !== src && !candidates.includes(swapped)) candidates.push(swapped);
+    }
+  }
+
   try {
-    const response = await fetchWithTimeout(
-      src,
-      { headers: { "User-Agent": UA, Referer: referer } },
-      15000
-    );
+    let response = null;
+    for (const target of candidates) {
+      try {
+        const attempt = await fetchWithTimeout(
+          target,
+          { headers: { "User-Agent": UA, Referer: referer } },
+          15000
+        );
+        if (attempt.ok) {
+          response = attempt;
+          break;
+        }
+      } catch {
+        // 换下一条线路。
+      }
+    }
+    if (!response) {
+      return jsonResponse({ error: "图片代理失败", message: "所有线路都取不到封面" }, 502);
+    }
     const bytes = new Uint8Array(await response.arrayBuffer());
     if (looksLikeImage(bytes)) {
       return imageResponse(bytes, response.headers.get("content-type"));

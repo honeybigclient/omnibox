@@ -90,6 +90,12 @@ interface PlayHistoryItem {
 }
 
 // --- Main Player Page Component ---
+// 黄果族的源：线上同步出来的 "hg_*"，以及原生的 "huangguo"。
+// 站内切源（包括播放失败自动切）只在这族里做，避免跳到别的采集站的枪版片源。
+function isHuangguoFamilyKey(key: string) {
+  return key === "huangguo" || key.startsWith("hg_");
+}
+
 function PlayerPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [movieDetails, setMovieDetails] = useState<Movie | null>(null);
@@ -628,11 +634,24 @@ function PlayerPage() {
                   )}/ep-${encodeURIComponent(ep)}/`;
                 }
                 const cacheKey = `hgBrowserPlay:${page}`;
+                // 地址里的 auth_key 有有效期，缓存太久会拿着一张过期的票反复失败。
+                const CACHE_TTL_MS = 20 * 60 * 1000;
                 try {
                   const cached = sessionStorage.getItem(cacheKey);
-                  if (cached) return cached;
+                  if (cached) {
+                    const parsed = JSON.parse(cached) as { url?: string; at?: number };
+                    if (
+                      parsed &&
+                      typeof parsed.url === "string" &&
+                      typeof parsed.at === "number" &&
+                      Date.now() - parsed.at < CACHE_TTL_MS
+                    ) {
+                      return parsed.url;
+                    }
+                    sessionStorage.removeItem(cacheKey);
+                  }
                 } catch {
-                  // 隐私模式读不到就现抓。
+                  // 旧格式或隐私模式：当作没缓存，现抓一次。
                 }
                 try {
                   const response = await fetch(page, {
@@ -669,7 +688,10 @@ function PlayerPage() {
                   }
                   if (stream) {
                     try {
-                      sessionStorage.setItem(cacheKey, stream);
+                      sessionStorage.setItem(
+                        cacheKey,
+                        JSON.stringify({ url: stream, at: Date.now() })
+                      );
                     } catch {
                       // 写不进去也不影响本次播放。
                     }
@@ -1120,8 +1142,10 @@ function PlayerPage() {
     const sources: { key: string; name: string }[] = [];
 
     try {
+      // 只在黄果这一族里找：别的采集站内容可能是枪版/带水印，
+      // 而且一次搜 68 个站既慢又容易被限流。
       await Promise.all(
-        getAllEnabledSites.map(async (site) => {
+        getAllEnabledSites.filter((site) => isHuangguoFamilyKey(site.key)).map(async (site) => {
           if (site.key === sourceKey) {
             sources.push({ key: site.key, name: site.name });
             return;
@@ -1187,6 +1211,13 @@ function PlayerPage() {
               })
               .filter((ep: Episode | null): ep is Episode => ep !== null);
 
+            if (!newEpisodes.length) {
+              if (playerRef.current) {
+                playerRef.current.notice.show = "那个源没有可播的剧集";
+              }
+              return;
+            }
+
             // 查找匹配的剧集号
             const targetEpisode = newEpisodes.find((ep: Episode) => ep.number === currentEpNum);
             const targetEpNum = targetEpisode ? currentEpNum : newEpisodes[0].number;
@@ -1224,7 +1255,11 @@ function PlayerPage() {
         }
         return;
       }
-      const next = availableSources.find((site) => !state.tried.has(site.key));
+      const next = availableSources.find(
+        (site) =>
+          !state.tried.has(site.key) &&
+          (!sourceKey || isHuangguoFamilyKey(site.key) === isHuangguoFamilyKey(sourceKey))
+      );
       if (!next) {
         if (playerRef.current) {
           playerRef.current.notice.show = `播放失败：${String(reason).slice(0, 80)}`;
