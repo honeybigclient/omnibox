@@ -86,7 +86,10 @@ const CORS = {
 };
 
 const HOUR = 60 * 60 * 1000;
-const DEFAULT_TTL_MS = 5 * HOUR; // 4~6 小时之间
+const MINUTE = 60 * 1000;
+// 上游池（含那 70 个采集站）的刷新间隔。调小一点，站点换域名/换接口时能跟上；
+// 想更勤快可以设 HUANGGUO_POOL_TTL_MS，最小 15 分钟，最大 6 小时。
+const DEFAULT_TTL_MS = 1 * HOUR;
 const DEFAULT_TIMEOUT_MS = 12000;
 const DEFAULT_BREAKER_THRESHOLD = 3;
 const DEFAULT_COOLDOWN_MS = 60 * 1000;
@@ -141,7 +144,11 @@ function envNumber(env, key, fallback) {
 }
 
 function poolTtl(env) {
-  return clamp(envNumber(env, "HUANGGUO_POOL_TTL_MS", DEFAULT_TTL_MS), 4 * HOUR, 6 * HOUR);
+  return clamp(
+    envNumber(env, "HUANGGUO_POOL_TTL_MS", DEFAULT_TTL_MS),
+    15 * MINUTE,
+    6 * HOUR
+  );
 }
 
 function upstreamTimeout(env) {
@@ -988,6 +995,11 @@ async function getPoolRaw(env, context, options = {}) {
       // 诊断端点遇到只有内置黄果的 bootstrap 池时，强制刷新一次，
       // 否则第一次打开 ?ac=upstreams 可能只看到一个上游。
       if (awaitRefresh && poolState.pool.source === "bootstrap") {
+        const fresh = await refreshPool(env);
+        if (fresh) return fresh;
+      }
+      // 诊断端点带 fresh=1 时无视 TTL，立刻重拉一遍配置（前端定时同步用）。
+      if (awaitRefresh && options.fresh === true) {
         const fresh = await refreshPool(env);
         if (fresh) return fresh;
       }
@@ -2005,7 +2017,9 @@ async function nativeDetail(upstream, id, origin, env) {
   const item = (Array.isArray(data.list) && data.list[0]) || null;
   if (!item) return { status: "not_found" };
 
-  let episodes = Array.isArray(item.episodes) ? item.episodes.slice(0, 100) : [];
+  let episodes = Array.isArray(item.episodes)
+    ? dedupeEpisodes(item.episodes.slice(0, 100))
+    : [];
   if (!episodes.length && String(id).startsWith("archives_")) {
     // 吃瓜详情可能没有 episodes，点播时再去 posts/detail 里找直链。
     episodes = [{ ep: "1", title: "第1集", url: "" }];
@@ -2682,6 +2696,51 @@ async function handleUpstreams(url, pool, env) {
 /* 图片代理                                                                    */
 /* -------------------------------------------------------------------------- */
 
+// 黄果封面是 AES-128-CBC 加密的原始二进制（不是 base64），
+// 密钥和 IV 来自上游解析站源码，解出来是 JPEG/PNG。
+const IMG_KEY = "f5d965df75336270";
+const IMG_IV = "97b60394abc2fbe1";
+
+/** 按图片魔数给出正确的 Content-Type，猜不出来再退回 octet-stream。 */
+function imageContentType(bytes) {
+  if (!bytes || bytes.length < 4) return "application/octet-stream";
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "image/jpeg";
+  if (bytes[0] === 0x89 && bytes[1] === 0x50) return "image/png";
+  if (bytes[0] === 0x47 && bytes[1] === 0x49) return "image/gif";
+  if (
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45
+  ) {
+    return "image/webp";
+  }
+  return "application/octet-stream";
+}
+
+async function aesDecryptImage(bytes) {
+  if (!bytes || !bytes.length || bytes.length % 16 !== 0) return null;
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(IMG_KEY),
+      "AES-CBC",
+      false,
+      ["decrypt"]
+    );
+    const plain = new Uint8Array(
+      await crypto.subtle.decrypt(
+        { name: "AES-CBC", iv: new TextEncoder().encode(IMG_IV) },
+        key,
+        bytes
+      )
+    );
+    return plain;
+  } catch {
+    return null;
+  }
+}
+
 function looksLikeImage(bytes) {
   if (!bytes || bytes.length < 12) return false;
   const b = bytes;
@@ -2731,27 +2790,13 @@ async function handleMedia(url, pool) {
       return imageResponse(bytes, response.headers.get("content-type"));
     }
 
-    // 黄果的封面在被 CDN 上可能是 AES-CBC 加密的原始二进制（不是 base64），
-    // 自己解密没必要——上游 Worker 的 /media 已经做好解密和魔数校验，借用它。
-    const workerApi = (upstream && upstream.api) || DEFAULT_API;
-    if (workerApi && !src.startsWith(workerApi)) {
-      try {
-        const proxied = await fetchWithTimeout(
-          `${workerApi}/media?url=${encodeURIComponent(src)}`,
-          { headers: { "User-Agent": UA, Referer: referer } },
-          15000
-        );
-        if (proxied.ok) {
-          const decrypted = new Uint8Array(await proxied.arrayBuffer());
-          if (looksLikeImage(decrypted)) {
-            return imageResponse(decrypted, proxied.headers.get("content-type"));
-          }
-        }
-      } catch {
-        // 兜不住就把原始内容返回，至少前端能拿到东西。
-      }
+    // 拿到的不是图片，先按黄果的加密方式本地解密（不依赖上游 worker，那个现在 403）。
+    const decrypted = await aesDecryptImage(bytes);
+    if (decrypted && looksLikeImage(decrypted)) {
+      return imageResponse(decrypted, imageContentType(decrypted));
     }
 
+    // 还是不行就原样返回，至少前端能拿到东西。
     return imageResponse(bytes, response.headers.get("content-type"));
   } catch (error) {
     return jsonResponse(
@@ -3934,6 +3979,25 @@ async function filterEpisodesByPlayable(upstream, id, episodes, title, env) {
   return kept;
 }
 
+/** 按集号 + 地址去重，防上游把同一集返两遍导致列表重复。 */
+function dedupeEpisodes(episodes) {
+  const seenNumber = new Set();
+  const seenUrl = new Set();
+  const out = [];
+  for (const [index, ep] of episodes.entries()) {
+    const number = String(
+      (ep && (ep.ep != null ? ep.ep : ep.ep_num)) || index + 1
+    );
+    const url = String((ep && ep.url) || "").trim();
+    if (seenNumber.has(number)) continue;
+    if (url && seenUrl.has(url)) continue;
+    seenNumber.add(number);
+    if (url) seenUrl.add(url);
+    out.push(ep);
+  }
+  return out;
+}
+
 /* -------------------------------------------------------------------------- */
 /* 镜像站直连（kind: huangguo-site）                                            */
 /* -------------------------------------------------------------------------- */
@@ -4223,7 +4287,9 @@ async function siteDetail(upstream, id, origin, env) {
   const vod = (data && data.data) || null;
   if (!vod) return { status: "not_found" };
 
-  const episodes = Array.isArray(vod.episodes) ? vod.episodes.slice(0, 100) : [];
+  const episodes = Array.isArray(vod.episodes)
+    ? dedupeEpisodes(vod.episodes.slice(0, 100))
+    : [];
   if (!episodes.length) {
     throw new UpstreamError(
       upstream,
@@ -4703,6 +4769,7 @@ export async function onRequest(context) {
   // 诊断端点首次访问时等待一次池刷新，保证能立即看到全部候选上游。
   const pool = await getPool(env, context, {
     awaitRefresh: ac === "upstreams" && !isMedia && !isPlay && !isM3u8,
+    fresh: ac === "upstreams" && url.searchParams.get("fresh") === "1",
   });
 
   if (ac === "playdebug") {

@@ -159,10 +159,16 @@
           }
         }
 
-        function sync(attempt) {
+        // 每 10 分钟看一次池子；每小时强制重拉一次配置，那 70 个采集站改了域名/接口也能跟上。
+        var FORCE_REFRESH_MS = 60 * 60 * 1000;
+        var lastForceAt = 0;
+
+        function sync(attempt, force) {
           if (running) return;
           running = true;
-          fetch("/huangguo/?ac=upstreams", {
+          var fresh = force === true;
+          if (fresh) lastForceAt = Date.now();
+          fetch("/huangguo/?ac=upstreams" + (fresh ? "&fresh=1" : ""), {
             cache: "no-store",
             credentials: "same-origin",
             headers: { Accept: "application/json" },
@@ -215,7 +221,8 @@
           // 长时间挂着的页面也能跟上池子变化（切回标签页或每 10 分钟）。
           setInterval(function () {
             if (document.visibilityState !== "visible") return;
-            sync(0);
+            var force = Date.now() - lastForceAt > FORCE_REFRESH_MS;
+            sync(0, force);
           }, INTERVAL_MS);
           document.addEventListener("visibilitychange", function () {
             if (document.visibilityState === "visible") sync(0);

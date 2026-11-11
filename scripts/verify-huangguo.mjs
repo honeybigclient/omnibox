@@ -10,7 +10,24 @@
  */
 
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { onRequest } from "../functions/huangguo/[[path]].js";
+
+// 与上游一致的封面密钥：用来造一张"真加密"的 PNG，验证本地解密分支。
+const COVER_KEY = "f5d965df75336270";
+const COVER_IV = "97b60394abc2fbe1";
+
+function encryptedCover() {
+  const png = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4, 5, 6,
+  ]);
+  const cipher = crypto.createCipheriv(
+    "aes-128-cbc",
+    Buffer.from(COVER_KEY),
+    Buffer.from(COVER_IV)
+  );
+  return new Uint8Array(Buffer.concat([cipher.update(png), cipher.final()]));
+}
 
 const SPIDER_JS_URL =
   "https://cdn.jsdelivr.net/gh/SikROo/huangguo-spider@latest/huangguo_web_spider.js";
@@ -303,11 +320,11 @@ globalThis.fetch = async (input, init = {}) => {
       });
     }
     if (parsed.pathname === "/cover.bin") {
-      // 模拟 AES 加密后的封面：不是任何图片魔数。
-      return new Response(
-        new Uint8Array([0x4a, 0x3f, 0x9a, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
-        { status: 200, headers: { "Content-Type": "application/octet-stream" } }
-      );
+      // 模拟真实的加密封面：AES-128-CBC，解出来是 PNG。
+      return new Response(encryptedCover(), {
+        status: 200,
+        headers: { "Content-Type": "application/octet-stream" },
+      });
     }
     return new Response(new Uint8Array([0, 1, 2, 3]), {
       status: 200,

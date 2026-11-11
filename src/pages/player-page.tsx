@@ -124,7 +124,7 @@ function PlayerPage() {
       }
 
       // 使用 # 分割剧集信息
-      return playUrlData
+      const parsed = playUrlData
         .split("#")
         .map((part: string) => {
           const [number, url] = part.split("$");
@@ -134,6 +134,16 @@ function PlayerPage() {
           return null;
         })
         .filter((ep: Episode | null): ep is Episode => ep !== null);
+
+      // 上游偶尔会把同一集返回两遍（多线路混排），按集号 + 地址去重，避免列表重复。
+      const seenNumber = new Set<string>();
+      const seenUrl = new Set<string>();
+      return parsed.filter((ep) => {
+        if (seenNumber.has(ep.number) || seenUrl.has(ep.url)) return false;
+        seenNumber.add(ep.number);
+        seenUrl.add(ep.url);
+        return true;
+      });
     } catch (error) {
       console.error("Error parsing episodes string:", error);
       return [];
