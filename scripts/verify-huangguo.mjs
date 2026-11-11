@@ -1228,7 +1228,9 @@ async function main() {
   result = await call(path, { env: failNativeEnv });
   await show("19. 详情上游 522（保留真实原因）", path, result);
   expect(result.body.code === 0, "detail 522 code 0");
-  expect(result.body.msg.includes("HTTP 522"), "detail 522 msg");
+  // worker 挂了会自动退到站点接口，所以这里可能报 522（worker）也可能报站点侧的 4xx/5xx，
+  // 关键是必须暴露真实的上游故障，不能伪装成"没有找到内容"。
+  expect(/HTTP [45]\d\d/.test(result.body.msg), "detail 522 msg keeps upstream status");
   expect(result.body.msg.includes("没有找到内容") === false, "detail not disguised");
 
   console.log("\n== 全部断言通过 ==");

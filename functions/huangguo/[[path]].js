@@ -1178,27 +1178,20 @@ function hostOfUrl(value) {
 }
 
 function mirrorUrls(upstream, url) {
-  const list = [url];
-  const mirrors = Array.isArray(upstream.mirrors) ? upstream.mirrors : [];
-  if (!mirrors.length) return list;
-  const siteHost = hostOfUrl(upstream.site);
   const target = hostOfUrl(url);
-  if (!target || target !== siteHost) return list;
+  const siteHost = hostOfUrl(upstream && upstream.site);
+  if (!target || !siteHost || target !== siteHost) return [url];
 
-  for (const mirror of mirrors.slice(0, 8)) {
-    try {
-      const m = new URL(mirror);
-      if (m.host === target) continue;
-      const swapped = new URL(url);
-      swapped.protocol = m.protocol;
-      swapped.host = m.host;
-      const candidate = swapped.toString();
-      if (!list.includes(candidate)) list.push(candidate);
-    } catch {
-      // 忽略坏的镜像地址。
-    }
+  // 用 siteBaseList 的顺序：上次成功的线路排在最前，省掉主站 403/超时的等待。
+  const bases = siteBaseList(upstream);
+  if (!bases.length) return [url];
+
+  const out = [];
+  for (const base of bases) {
+    const candidate = swapHost(url, base);
+    if (!out.includes(candidate)) out.push(candidate);
   }
-  return list;
+  return out;
 }
 
 async function requestUpstreamJson(upstream, url, env, options = {}) {
@@ -1267,6 +1260,7 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
       }
 
       if (!options.silent) markSuccess(upstream, ms);
+      rememberSiteBase(upstream, originOf(target));
       return { data, ms, status };
     } catch (error) {
       const ms = Date.now() - start;
@@ -1537,13 +1531,28 @@ async function nativeSearch(upstream, keyword, origin, env) {
 
 async function fetchPageStream(upstream, pageUrl, ep, timeoutMs) {
   if (!isHttpUrl(pageUrl)) return "";
+  // 主站 403 很常见，逐条线路试：主站 → 镜像。
+  const targets = siteBaseList(upstream).map((base) =>
+    swapHost(pageUrl, base)
+  );
+  for (const target of targets.length ? targets : [pageUrl]) {
+    const stream = await fetchOnePageStream(upstream, target, ep, timeoutMs);
+    if (stream) {
+      rememberSiteBase(upstream, originOf(target));
+      return stream;
+    }
+  }
+  return "";
+}
+
+async function fetchOnePageStream(upstream, pageUrl, ep, timeoutMs) {
   try {
     const response = await fetchWithTimeout(
       pageUrl,
       {
         headers: {
           "User-Agent": UA,
-          Referer: `${upstream.site}/`,
+          Referer: `${originOf(pageUrl) || upstream.site}/`,
         },
       },
       timeoutMs
@@ -1628,9 +1637,17 @@ async function lookupTitle(upstream, id, env) {
  * （老剧尤其明显）。这里先抓一次页面、留下 set-cookie，再带 cookie 请求接口。
  */
 async function warmupSiteCookies(upstream, id, env) {
+  for (const base of siteBaseList(upstream)) {
+    const cookie = await warmupOneSiteCookie(upstream, base, id);
+    if (cookie) return cookie;
+  }
+  return "";
+}
+
+async function warmupOneSiteCookie(upstream, base, id) {
   try {
     const response = await fetchWithTimeout(
-      `${upstream.site}/video/${encodeURIComponent(id)}/`,
+      `${base}/video/${encodeURIComponent(id)}/`,
       {
         headers: {
           "User-Agent": UA,
@@ -2459,12 +2476,18 @@ async function handleDetailList(url, pool, env) {
 
     if (slug) {
       try {
-        const result =
-          upstream.kind === "huangguo"
-            ? await nativeSearch(upstream, keyword, origin, env)
-            : upstream.kind === "huangguo-site"
-              ? await siteSearch(upstream, keyword, origin, env)
-              : await maccmsSearch(upstream, keyword, origin, env);
+        let result;
+        if (upstream.kind === "huangguo") {
+          result = await withSiteFallback(
+            upstream,
+            () => nativeSearch(upstream, keyword, origin, env),
+            () => siteSearch(upstream, keyword, origin, env)
+          );
+        } else if (upstream.kind === "huangguo-site") {
+          result = await siteSearch(upstream, keyword, origin, env);
+        } else {
+          result = await maccmsSearch(upstream, keyword, origin, env);
+        }
         const list = result.list.map((item) => decorateSearchItem(item, upstream));
         return jsonResponse({
           code: 1,
@@ -2529,12 +2552,18 @@ async function handleDetailList(url, pool, env) {
       : "");
 
   try {
-    const result =
-      upstream.kind === "huangguo"
-        ? await nativeList(upstream, typeId, page, origin, env)
-        : upstream.kind === "huangguo-site"
-          ? await siteList(upstream, typeId, page, origin, env)
-          : await maccmsList(upstream, typeId, page, origin, env);
+    let result;
+    if (upstream.kind === "huangguo") {
+      result = await withSiteFallback(
+        upstream,
+        () => nativeList(upstream, typeId, page, origin, env),
+        () => siteList(upstream, typeId, page, origin, env)
+      );
+    } else if (upstream.kind === "huangguo-site") {
+      result = await siteList(upstream, typeId, page, origin, env);
+    } else {
+      result = await maccmsList(upstream, typeId, page, origin, env);
+    }
     return jsonResponse({
       code: 1,
       msg: "数据列表",
@@ -2566,12 +2595,18 @@ async function handleDetail(url, pool, env) {
 
   const { upstream } = parsed;
   try {
-    const result =
-      upstream.kind === "huangguo"
-        ? await nativeDetail(upstream, parsed.firstId, url.origin, env)
-        : upstream.kind === "huangguo-site"
-          ? await siteDetail(upstream, parsed.firstId, url.origin, env)
-          : await maccmsDetail(upstream, parsed.ids, url.origin, env);
+    let result;
+    if (upstream.kind === "huangguo") {
+      result = await withSiteFallback(
+        upstream,
+        () => nativeDetail(upstream, parsed.firstId, url.origin, env),
+        () => siteDetail(upstream, parsed.firstId, url.origin, env)
+      );
+    } else if (upstream.kind === "huangguo-site") {
+      result = await siteDetail(upstream, parsed.firstId, url.origin, env);
+    } else {
+      result = await maccmsDetail(upstream, parsed.ids, url.origin, env);
+    }
 
     if (result.status === "not_found") {
       return jsonResponse({
@@ -3935,7 +3970,8 @@ async function siteSearch(upstream, keyword, origin, env) {
     upstream,
     `${upstream.site}/api/search?q=${encodeURIComponent(keyword)}&page=1&size=30`,
     env,
-    { timeoutMs: 9000 }
+    // 站点请求不受 worker 熔断影响：worker 403 三次后不该把镜像线路一起挡掉。
+    { timeoutMs: 9000, bypassBreaker: true }
   );
   const items =
     data && data.data && Array.isArray(data.data.items) ? data.data.items : [];
@@ -3948,6 +3984,119 @@ async function siteSearch(upstream, keyword, origin, env) {
 }
 
 /**
+ * 先试 worker，基础设施故障就退到站点接口（站点内部还会换镜像线路）。
+ * 站点侧若是语义错误（没内容/没片源），仍抛原始故障，避免把 403 说成"没有这部剧"。
+ */
+async function withSiteFallback(upstream, primary, fallback) {
+  if (workerUsable(upstream)) {
+    try {
+      const value = await primary();
+      clearWorkerPenalty(upstream);
+      return value;
+    } catch (error) {
+      if (!shouldFallbackToSite(error)) throw error;
+      penalizeWorker(upstream);
+      try {
+        return await fallback();
+      } catch (fallbackError) {
+        if (!shouldFallbackToSite(fallbackError)) throw error;
+        throw fallbackError;
+      }
+    }
+  }
+  return fallback();
+}
+
+/**
+ * worker 接口"最近不可用"的短暂记忆。
+ * 一旦 403/超时，5 分钟内直接走站点/镜像，不再每次都白等一遍。
+ */
+const workerPenalty = new Map(); // api -> until
+const WORKER_PENALTY_MS = 5 * 60 * 1000;
+
+function workerUsable(upstream) {
+  const entry = workerPenalty.get(upstream.api);
+  return !entry || Date.now() > entry.until;
+}
+
+function penalizeWorker(upstream) {
+  if (upstream && upstream.api) {
+    workerPenalty.set(upstream.api, { until: Date.now() + WORKER_PENALTY_MS });
+  }
+}
+
+function clearWorkerPenalty(upstream) {
+  if (upstream && upstream.api) workerPenalty.delete(upstream.api);
+}
+
+/** 只有"基础设施类"故障才退到站点接口；语义错误（没内容/没片源）不要掩盖。 */
+const SITE_FALLBACK_KINDS = new Set([
+  "http",
+  "network",
+  "timeout",
+  "parse",
+  "abort",
+  "circuit_open",
+  "upstream",
+]);
+
+function shouldFallbackToSite(error) {
+  if (!(error instanceof UpstreamError)) return true;
+  return SITE_FALLBACK_KINDS.has(String(error.kind || ""));
+}
+
+/**
+ * 站点的候选基地址：主站 + 镜像线路。
+ * 主站（huangguoai.com）对机房 IP 时不时回 403，镜像站（thu/pku.adihsppe.cc 等）
+ * 走的是同一套后端但 CDN 不同，主站被挡时换镜像基本都能通。
+ */
+const siteBaseMemo = new Map(); // slug -> { base, at }：记住上次成功的线路
+const SITE_BASE_MEMO_TTL_MS = 10 * 60 * 1000;
+
+function rememberSiteBase(upstream, base) {
+  if (!upstream || !base) return;
+  siteBaseMemo.set(upstream.slug, { base: normalizeBase(base), at: Date.now() });
+}
+
+function siteBaseList(upstream) {
+  const bases = [];
+  const add = (value) => {
+    const base = normalizeBase(value);
+    if (base && !bases.includes(base)) bases.push(base);
+  };
+  add(upstream && upstream.site);
+  for (const mirror of Array.isArray(upstream && upstream.mirrors)
+    ? upstream.mirrors
+    : []) {
+    add(mirror);
+  }
+
+  // 上次哪条线路成功过，就把它挪到最前面，省掉主站 403 或超时的等待。
+  const memo = siteBaseMemo.get(upstream && upstream.slug);
+  if (memo && Date.now() - memo.at < SITE_BASE_MEMO_TTL_MS) {
+    const index = bases.indexOf(memo.base);
+    if (index > 0) {
+      bases.splice(index, 1);
+      bases.unshift(memo.base);
+    }
+  }
+  return bases;
+}
+
+/** 把页面/接口地址的主机换成镜像主机，路径和参数保持不变。 */
+function swapHost(target, base) {
+  try {
+    const url = new URL(target);
+    const next = new URL(base);
+    url.protocol = next.protocol;
+    url.host = next.host;
+    return url.toString();
+  } catch {
+    return target;
+  }
+}
+
+/**
  * 站点 2026-11 起把"取播放地址"从 GET /api/videos/{id}/play 换成了
  *   POST /api/videos/{id}/episodes/{ep}/playback
  * 返回 { streams: { main, hevc, preview }, cdn: {...} }。老的 GET 接口现在
@@ -3955,49 +4104,78 @@ async function siteSearch(upstream, keyword, origin, env) {
  * 返回的 m3u8 本身带 ACAO:*，不需要额外鉴权头，浏览器可以直连。
  */
 async function sitePlayback(upstream, id, ep, env) {
-  const pageUrl = `${upstream.site}/video/${encodeURIComponent(
-    id
-  )}/ep-${encodeURIComponent(ep)}/`;
-  const target = `${upstream.site}/api/videos/${encodeURIComponent(
+  const path = `/api/videos/${encodeURIComponent(
     id
   )}/episodes/${encodeURIComponent(ep)}/playback`;
-  const started = Date.now();
-  const response = await fetchWithTimeout(
-    target,
-    {
-      method: "POST",
-      headers: {
-        "User-Agent": UA,
-        "Content-Type": "application/json",
-        Accept: "application/json, text/plain, */*",
-        Referer: pageUrl,
-        Origin: upstream.site,
-      },
-      body: "{}",
-    },
-    9000
+  const bases = siteBaseList(upstream);
+  let lastError = null;
+
+  for (const base of bases) {
+    const started = Date.now();
+    try {
+      const response = await fetchWithTimeout(
+        `${base}${path}`,
+        {
+          method: "POST",
+          headers: {
+            "User-Agent": UA,
+            "Content-Type": "application/json",
+            Accept: "application/json, text/plain, */*",
+            Referer: `${base}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`,
+            Origin: base,
+          },
+          body: "{}",
+        },
+        9000
+      );
+      if (!response.ok) {
+        lastError = new UpstreamError(
+          upstream,
+          "http",
+          `HTTP ${response.status}`,
+          { status: response.status, ms: Date.now() - started }
+        );
+        continue; // 403/503 就换下一条线路
+      }
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        lastError = new UpstreamError(upstream, "parse", "响应不是有效 JSON", {
+          status: response.status,
+          ms: Date.now() - started,
+        });
+        continue;
+      }
+      const payload = (data && data.data) || {};
+      const streams = payload.streams || {};
+      const url = String(streams.main || streams.hevc || "").trim();
+      markSuccess(upstream, Date.now() - started);
+      rememberSiteBase(upstream, base);
+      return {
+        url: isHttpUrl(url) ? url : "",
+        payload,
+        status: response.status,
+        base,
+      };
+    } catch (error) {
+      lastError =
+        error instanceof UpstreamError
+          ? error
+          : new UpstreamError(
+              upstream,
+              "network",
+              String((error && error.message) || error),
+              { ms: Date.now() - started }
+            );
+    }
+  }
+
+  throw (
+    lastError ||
+    new UpstreamError(upstream, "network", "所有站点线路都不可用", { ms: 0 })
   );
-  if (!response.ok) {
-    throw new UpstreamError(upstream, "http", `HTTP ${response.status}`, {
-      status: response.status,
-      ms: Date.now() - started,
-    });
-  }
-  const text = await response.text();
-  let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    throw new UpstreamError(upstream, "parse", "响应不是有效 JSON", {
-      status: response.status,
-      ms: Date.now() - started,
-    });
-  }
-  const payload = (data && data.data) || {};
-  const streams = payload.streams || {};
-  const url = String(streams.main || streams.hevc || "").trim();
-  markSuccess(upstream, Date.now() - started);
-  return { url: isHttpUrl(url) ? url : "", payload, status: response.status };
 }
 
 /**
@@ -4016,6 +4194,7 @@ async function siteList(upstream, typeId, page, origin, env) {
 
   const { data } = await requestUpstreamJson(upstream, target, env, {
     timeoutMs: 9000,
+    bypassBreaker: true,
   });
   const payload = (data && data.data) || {};
   const items = Array.isArray(payload.items) ? payload.items : [];
@@ -4039,7 +4218,7 @@ async function siteDetail(upstream, id, origin, env) {
     upstream,
     `${upstream.site}/api/videos/${encodeURIComponent(id)}`,
     env,
-    { timeoutMs: 9000 }
+    { timeoutMs: 9000, bypassBreaker: true }
   );
   const vod = (data && data.data) || null;
   if (!vod) return { status: "not_found" };
