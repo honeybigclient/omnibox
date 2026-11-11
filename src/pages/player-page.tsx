@@ -107,6 +107,12 @@ function PlayerPage() {
   const failoverState = useRef({ tried: new Set<string>(), busy: false });
   const failoverRef = useRef<(reason: string) => void>(() => {});
   const switchSourceRef = useRef<(key: string) => Promise<void>>(async () => {});
+  // 播放器的 video:ended 回调只注册一次，直接读 state 会永远拿到创建那一刻的旧值，
+  // 于是 "播完第四集自动跳回第二集"。统一改成读 ref。
+  const currentSourceRef = useRef<string | null>(null);
+  const sortedEpisodesRef = useRef<Episode[]>([]);
+  const sortOrderRef = useRef<"asc" | "desc">("asc");
+  const handleEpisodeSelectRef = useRef<(episode: Episode) => void>(() => {});
 
   const vodId = searchParams.get("vodId");
   const initialEpNum = searchParams.get("epNum");
@@ -867,22 +873,21 @@ function PlayerPage() {
 
       // 监听视频播放完毕事件
       art.on("video:ended", () => {
-        const currentIndex = sortedEpisodes.findIndex((ep) => ep.url === currentSource);
-        let nextEpisode: Episode | undefined;
-
-        if (sortOrder === "asc") {
-          // 正序播放，下一集索引 +1
-          nextEpisode = sortedEpisodes[currentIndex + 1];
-        } else {
-          // 倒序播放，下一集索引 -1
-          nextEpisode = sortedEpisodes[currentIndex - 1];
+        const source = currentSourceRef.current;
+        const list = sortedEpisodesRef.current;
+        const order = sortOrderRef.current;
+        const currentIndex = list.findIndex((ep) => ep.url === source);
+        if (currentIndex < 0) {
+          art.notice.show = "找不到当前剧集，无法自动播放下一集";
+          return;
         }
 
+        const nextEpisode =
+          order === "asc" ? list[currentIndex + 1] : list[currentIndex - 1];
+
         if (nextEpisode) {
-          // 如果还有下一集，自动播放下一集
-          handleEpisodeSelect(nextEpisode);
+          handleEpisodeSelectRef.current(nextEpisode);
         } else {
-          // 没有下一集，显示播放完毕提示
           art.notice.show = "全部剧集已播放完毕";
         }
       });
@@ -1092,6 +1097,12 @@ function PlayerPage() {
       }
     }
   };
+
+  // 把最新状态同步进 ref，供播放器里只注册一次的回调（video:ended 等）使用。
+  currentSourceRef.current = currentSource;
+  sortedEpisodesRef.current = sortedEpisodes;
+  sortOrderRef.current = sortOrder;
+  handleEpisodeSelectRef.current = handleEpisodeSelect;
 
   // 获取所有启用的资源站
   const getAllEnabledSites = useMemo(() => {
