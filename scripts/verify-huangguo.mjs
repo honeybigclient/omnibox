@@ -273,6 +273,8 @@ function slowResponse(init) {
   });
 }
 
+const capture = { playHeaders: null };
+
 globalThis.fetch = async (input, init = {}) => {
   const url = typeof input === "string" ? input : input.url;
   const parsed = new URL(url);
@@ -509,6 +511,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (parsed.pathname === "/api/detail/13400") return json(nativeMirrorDetail);
     if (parsed.pathname === "/api/detail/99999") return json(nativeEmptyDetail);
     if (parsed.pathname === "/api/play") {
+      capture.playHeaders = init.headers || {};
       const target = String(parsed.searchParams.get("url") || "");
       if (
         target.includes("12700") ||
@@ -516,7 +519,8 @@ globalThis.fetch = async (input, init = {}) => {
         target.includes("13000") ||
         target.includes("13200") ||
         target.includes("13300") ||
-        target.includes("13400")
+        target.includes("13400") ||
+        target.includes("13600")
       ) {
         return json({ url: "", proxy: "" });
       }
@@ -914,6 +918,16 @@ async function main() {
     playlist.includes("/huangguo/hls?src=https%3A%2F%2Fcdn.test%2Faudio.m3u8"),
     "nested playlist proxied"
   );
+
+  // 6j1. Worker 请求必须带反爬签名头，否则 403 sig_missing。
+  path =
+    "/huangguo/play.m3u8?up=huangguo-web&id=12527&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/12527/ep-1/");
+  result = await call(path);
+  const signedHeaders = capture.playHeaders || {};
+  expect(Boolean(signedHeaders["X-HG-Sig"]), "worker play carries X-HG-Sig");
+  expect(Boolean(signedHeaders["X-HG-Ts"]), "worker play carries X-HG-Ts");
+  expect(signedHeaders.Origin === "https://drdrdrrddrdr.github.io", "worker play origin");
 
   // 6j2. 新版取址带 cdn 鉴权：必须强制走代理，并把 ak/av 带下去。
   path =

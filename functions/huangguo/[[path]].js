@@ -91,6 +91,48 @@ const UA_CANDIDATES = [
 
 const uaProfile = new Map(); // host -> 被上游接受的 UA
 
+/**
+ * Worker 2026-11-13 起加的反爬签名（来自上游 spider v10.4 的实现）：
+ *   - 请求头必须带 Origin / Referer = 站点来源
+ *   - X-HG-Ts = 5 分钟时间窗起点（epoch 秒）
+ *   - X-HG-Sig = HMAC-SHA256(secret, win + "\n" + pathWithQuery) 的十六进制
+ * 缺任一项就是 403 sig_missing / ua，列表、详情、播放全空。
+ */
+const HG_SECRET = "hg-dx150-2026-11-w7Qm4pLz";
+const HG_ORIGIN = "https://drdrdrrddrdr.github.io";
+const HG_REFERER = "https://drdrdrrddrdr.github.io/huangguo-web/";
+const HG_WINDOW_SECONDS = 300;
+
+async function hmacHex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const mac = new Uint8Array(
+    await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message))
+  );
+  let out = "";
+  for (const byte of mac) out += byte.toString(16).padStart(2, "0");
+  return out;
+}
+
+/** 目标地址属于 Worker 时，返回带签名的一组请求头。 */
+async function hgSignedHeaders(target, apiBase, shift = 0) {
+  const base = String(apiBase || "").replace(/\/+$/, "");
+  if (!base || !String(target).startsWith(base)) return null;
+  const pathWithQuery = String(target).slice(base.length) || "/";
+  const win = Math.floor(Date.now() / 1000 / HG_WINDOW_SECONDS) + shift;
+  return {
+    Origin: HG_ORIGIN,
+    Referer: HG_REFERER,
+    "X-HG-Ts": String(win * HG_WINDOW_SECONDS),
+    "X-HG-Sig": await hmacHex(HG_SECRET, `${win}\n${pathWithQuery}`),
+  };
+}
+
 function uaFor(target) {
   const host = hostOfUrl(target) || String(target || "");
   return uaProfile.get(host) || UA;
@@ -157,12 +199,13 @@ const DEFAULT_PROBE_DEADLINE_MS = 9000;
 const POOL_CACHE_URL = "https://huangguo.internal/__upstreams_v2";
 const BOOTSTRAP_TTL_MS = 30 * 1000;
 
+// 2026-11 起源站把「换脸专区 / 魔改专区」下线（HTTP 410），分类里不再列出。
 const HUANGGUO_CLASSES = [
   { type_id: "ai-duanju", type_name: "AI短剧" },
   { type_id: "ai-manju", type_name: "AI漫剧" },
-  { type_id: "ai-huanlian", type_name: "换脸专区" },
-  { type_id: "ai-mogai", type_name: "魔改专区" },
-  { type_id: "chigua", type_name: "吃瓜·全部" },
+  { type_id: "chigua:all", type_name: "吃瓜·全部" },
+  { type_id: "chigua:hot", type_name: "吃瓜·热门" },
+  { type_id: "chigua:ai", type_name: "吃瓜·AI原创" },
   { type_id: "rank:hot", type_name: "热播榜" },
   { type_id: "rank:recommend", type_name: "推荐榜" },
   { type_id: "rank:potential", type_name: "潜力榜" },
@@ -1286,7 +1329,7 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
     );
   }
 
-  const headers = {
+  const baseHeaders = {
     "User-Agent": UA,
     Referer: refererOf(upstream),
     Accept: "application/json, text/plain, */*",
@@ -1301,9 +1344,19 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
     const start = Date.now();
     let status = null;
     try {
-      const { response } = await fetchWithUaFallback(target, headers, timeoutMs);
-      status = response.status;
-      const text = await response.text();
+      // 手机时钟可能偏，403 时换相邻时间窗再试。
+      let response = null;
+      let text = "";
+      for (const shift of [0, -1, 1]) {
+        const signed = await hgSignedHeaders(target, upstream.api, shift);
+        const headers = signed ? { ...baseHeaders, ...signed } : baseHeaders;
+        const attempt = await fetchWithUaFallback(target, headers, timeoutMs);
+        response = attempt.response;
+        status = response.status;
+        text = await response.text();
+        if (status !== 403 || !signed) break;
+        if (!/sig_missing|"ua"/i.test(text)) break;
+      }
       const ms = Date.now() - start;
 
       if (!response.ok) {
@@ -1853,7 +1906,40 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
   const remaining = (max) =>
     Math.max(1000, Math.min(max || 25000, deadline - Date.now()));
   const attempts = [];
-  // 最快的路：POST /playback 直接取址（2026-11 起的官方方式），成功就不用下面那些兜底了。
+
+  // 第一优先：Worker 的 /api/play（2026-11 起需要 HMAC 签名，否则 403 sig_missing）。
+  try {
+    const started = Date.now();
+    const { data, status } = await requestUpstreamJson(
+      upstream,
+      `${upstream.api}/api/play?url=${encodeURIComponent(
+        id
+      )}&ep=${encodeURIComponent(ep)}`,
+      env,
+      { timeoutMs: remaining(9000) }
+    );
+    const url =
+      String((data && data.url) || "").trim() || deepFindMediaUrl(data);
+    if (isHttpUrl(url)) {
+      attempts.push({ step: "worker-play", ok: true, status, ms: Date.now() - started });
+      return {
+        url,
+        attempts,
+        preferDirect: true,
+        payload: data,
+      };
+    }
+    attempts.push({
+      step: "worker-play",
+      ok: false,
+      status,
+      reason: "没有拿到可播放地址",
+    });
+  } catch (error) {
+    attempts.push({ step: "worker-play", ok: false, ...playAttemptError(error) });
+  }
+
+  // 第二优先：站点自己的取址接口（结构改过多次，能通就用）。
   try {
     const playback = await sitePlayback(upstream, id, ep, env);
     if (isHttpUrl(playback.url)) {
@@ -3002,6 +3088,57 @@ async function handleNetCheck(url, request, env, pool) {
     uaProbe.push(row);
   }
 
+  // raw=<url>[&grep=<regex>][&max=10]：把任意地址抓回来（可按正则摘取），
+  // 用来读站点自己的 JS，看它是怎么给接口签名的。
+  const rawTarget = String(url.searchParams.get("raw") || "").trim();
+  if (rawTarget) {
+    if (!isHttpUrl(rawTarget)) {
+      return jsonResponse({ error: "raw 需要 http(s) 地址" }, 400);
+    }
+    const started = Date.now();
+    try {
+      const response = await fetchWithTimeout(
+        rawTarget,
+        { headers: { "User-Agent": UA, Accept: "*/*" } },
+        12000
+      );
+      const body = await response.text();
+      const pattern = String(url.searchParams.get("grep") || "").trim();
+      const max = Math.min(20, Number(url.searchParams.get("max")) || 6);
+      let matches = [];
+      if (pattern) {
+        try {
+          const regex = new RegExp(pattern, "gi");
+          let hit;
+          while ((hit = regex.exec(body)) && matches.length < max) {
+            matches.push(
+              body.slice(
+                Math.max(0, hit.index - 80),
+                Math.min(body.length, hit.index + 220)
+              )
+            );
+          }
+        } catch (error) {
+          matches = [`正则无效：${error.message}`];
+        }
+      }
+      return jsonResponse({
+        code: 1,
+        url: rawTarget,
+        status: response.status,
+        bytes: body.length,
+        ms: Date.now() - started,
+        matches,
+        ...(pattern ? {} : { head: body.slice(0, 4000) }),
+      });
+    } catch (error) {
+      return jsonResponse(
+        { code: 0, url: rawTarget, error: String((error && error.message) || error) },
+        502
+      );
+    }
+  }
+
   // discover=1：翻站点自己的前端代码，看它到底调哪些接口、带哪些参数。
   let discovery = null;
   if (url.searchParams.get("discover") === "1") {
@@ -3064,6 +3201,9 @@ async function handleNetCheck(url, request, env, pool) {
       `${site}/api/search/${encodeURIComponent("时停手表")}?page=1&size=5`,
       `${site}/api/videos?page=1&size=5&type_id=ai-duanju`,
       `${site}/api/videos?page=1&size=5&category_id=ai-duanju`,
+      `${HUANGGUO_ME}/api/videos?page=1&size=5`,
+      `${HUANGGUO_ME}/api/playlet?page=1&size=5`,
+      `${site}/api/videos/12`,
     ];
     const probeResults = [];
     for (const target of candidates) {
