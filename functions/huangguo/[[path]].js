@@ -4139,6 +4139,8 @@ async function resolveCandidatePlay(candidate, ctx) {
         referer: refererOf(candidate),
         preferDirect: native.preferDirect !== false,
         attempts: native.attempts,
+        // CDN 鉴权（authKey/authValue）要一路传到 handlePlay。
+        payload: native.payload,
       };
     }
 

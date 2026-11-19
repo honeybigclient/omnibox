@@ -427,6 +427,28 @@ globalThis.fetch = async (input, init = {}) => {
   }
 
   if (parsed.hostname === "site.test") {
+    // 新版取址接口：streams.main + cdn 鉴权头
+    if (
+      parsed.pathname === "/api/videos/13600/episodes/1/playback" ||
+      parsed.pathname === "/api/videos/13600/episodes/2/playback"
+    ) {
+      const ep = parsed.pathname.includes("/episodes/2/") ? 2 : 1;
+      return json({
+        code: 1,
+        data: {
+          id: "13600",
+          ep,
+          streams: {
+            main: `https://cdn.test/auth-play-${ep}.m3u8?auth_key=abc&via=dx`,
+          },
+          cdn: {
+            m3u8Enabled: true,
+            authKey: "x-cdn-auth",
+            authValue: "4aae16c3b20e",
+          },
+        },
+      });
+    }
     if (parsed.pathname === "/video/13300/") {
       return new Response("<html>player</html>", {
         status: 200,
@@ -892,6 +914,19 @@ async function main() {
     playlist.includes("/huangguo/hls?src=https%3A%2F%2Fcdn.test%2Faudio.m3u8"),
     "nested playlist proxied"
   );
+
+  // 6j2. 新版取址带 cdn 鉴权：必须强制走代理，并把 ak/av 带下去。
+  path =
+    "/huangguo/play.m3u8?up=huangguo-web&id=13600&ep=1&page=" +
+    encodeURIComponent("https://site.test/video/13600/ep-1/");
+  result = await call(path);
+  await show("6j2. 取址带 CDN 鉴权", path, result);
+  expect(result.status === 302, "auth playback 302");
+  const authLocation = String(result.response.headers.get("location") || "");
+  console.log("  location =", authLocation.slice(0, 160));
+  expect(authLocation.includes("/huangguo/hls?"), "auth playback goes through proxy");
+  expect(authLocation.includes("ak=x-cdn-auth"), "auth key carried");
+  expect(authLocation.includes("av=4aae16c3b20e"), "auth value carried");
 
   // 6k2. 没有签名的代理地址一律拒绝，防止被当成开放代理刷流量。
   result = await call(
