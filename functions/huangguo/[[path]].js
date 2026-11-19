@@ -1245,10 +1245,17 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
       const ms = Date.now() - start;
 
       if (!response.ok) {
-        throw new UpstreamError(upstream, "http", `HTTP ${response.status}`, {
-          status,
-          ms,
-        });
+        // 把上游自己的报错带出来，不然只知道 400，不知道它嫌哪里不对。
+        const snippet = String(text || "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 120);
+        throw new UpstreamError(
+          upstream,
+          "http",
+          `HTTP ${response.status}${snippet ? `（${snippet}）` : ""}`,
+          { status, ms }
+        );
       }
 
       let data;
@@ -1462,19 +1469,63 @@ async function mapLimit(items, limit, mapper) {
 /* 原生黄果上游                                                                */
 /* -------------------------------------------------------------------------- */
 
+/** 记一下哪个 size/sort 组合被上游接受，下次直接用。 */
+const listProfile = new Map(); // slug -> { size, sort }
+
+function listVariants(build, profile) {
+  const sizes = profile ? [profile.size, 50, 20, 10] : [50, 20, 10];
+  const sorts = profile ? [profile.sort, "latest", ""] : ["latest", ""];
+  const urls = [];
+  for (const size of sizes) {
+    for (const sort of sorts) {
+      const url = build(size, sort);
+      if (!urls.includes(url)) urls.push(url);
+    }
+  }
+  return urls;
+}
+
 async function nativeList(upstream, typeId, page, origin, env) {
   const type = typeId || "ai-duanju";
-  let url = `${upstream.api}/api/category/${encodeURIComponent(type)}?page=${page}&size=50&sort=latest`;
+  const profile = listProfile.get(upstream.slug);
 
-  if (type.startsWith("rank:")) {
-    const kind = type.slice("rank:".length) || "hot";
-    url = `${upstream.api}/api/ranks/${encodeURIComponent(kind)}?page=${page}&size=50`;
-  } else if (type.startsWith("chigua")) {
-    const cate = type.split(":")[1] || "all";
-    url = `${upstream.api}/api/chigua?cate=${encodeURIComponent(cate)}&page=${page}&size=50`;
+  const build = (size, sort) => {
+    if (type.startsWith("rank:")) {
+      const kind = type.slice("rank:".length) || "hot";
+      return `${upstream.api}/api/ranks/${encodeURIComponent(kind)}?page=${page}&size=${size}`;
+    }
+    if (type.startsWith("chigua")) {
+      const cate = type.split(":")[1] || "all";
+      return `${upstream.api}/api/chigua?cate=${encodeURIComponent(cate)}&page=${page}&size=${size}`;
+    }
+    const base = `${upstream.api}/api/category/${encodeURIComponent(type)}?page=${page}&size=${size}`;
+    return sort ? `${base}&sort=${sort}` : base;
+  };
+
+  // 上游偶尔会收紧参数（比如 size 上限、sort 取值），400 就在几个常规组合里试。
+  let data = null;
+  let lastError = null;
+  let used = null;
+  for (const target of listVariants(build, profile)) {
+    try {
+      const result = await requestUpstreamJson(upstream, target, env);
+      data = result.data;
+      used = target;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof UpstreamError) || error.kind !== "http") throw error;
+      if (Number(error.status) !== 400) throw error;
+    }
+  }
+  if (!data) throw lastError || new UpstreamError(upstream, "http", "列表请求失败");
+
+  if (used) {
+    const size = Number((used.match(/size=(\d+)/) || [])[1] || 50);
+    const sort = (used.match(/sort=([a-z]+)/) || [])[1] || "";
+    listProfile.set(upstream.slug, { size, sort });
   }
 
-  const { data } = await requestUpstreamJson(upstream, url, env);
   const list = (Array.isArray(data.list) ? data.list : [])
     .map((item) => toNativeVod(item, upstream, origin, false))
     .filter((item) => item.vod_id && item.vod_name)
@@ -1487,13 +1538,32 @@ async function nativeSearch(upstream, keyword, origin, env) {
   const warnings = [];
   let list = [];
 
+  const searchProfile = listProfile.get(upstream.slug);
+  const sizes = searchProfile
+    ? [searchProfile.size, 50, 20, 10]
+    : [50, 20, 10];
+
   try {
-    const { data } = await requestUpstreamJson(
-      upstream,
-      `${upstream.api}/api/search/${encodeURIComponent(keyword)}?page=1&size=50`,
-      env,
-      { timeoutMs: searchTimeout(env) }
-    );
+    let data = null;
+    let lastError = null;
+    for (const size of sizes) {
+      try {
+        const result = await requestUpstreamJson(
+          upstream,
+          `${upstream.api}/api/search/${encodeURIComponent(keyword)}?page=1&size=${size}`,
+          env,
+          { timeoutMs: searchTimeout(env) }
+        );
+        data = result.data;
+        break;
+      } catch (error) {
+        lastError = error;
+        // 只有参数被拒（400）才换 size 再试。
+        if (!(error instanceof UpstreamError) || error.kind !== "http") throw error;
+        if (Number(error.status) !== 400) throw error;
+      }
+    }
+    if (!data) throw lastError;
     if (Array.isArray(data.list)) {
       list = data.list
         .map((item) => toNativeVod(item, upstream, origin, false))
