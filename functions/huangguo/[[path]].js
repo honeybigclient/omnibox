@@ -78,6 +78,61 @@ const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+/**
+ * worker 会对不认识的 UA 直接回 403 {"error":"forbidden","reason":"ua"}。
+ * 站点本身是手机 H5，这里把常见移动端 UA 也备上，谁被接受就用谁。
+ */
+const UA_CANDIDATES = [
+  UA,
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
+  "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.49(0x18003137) NetType/WIFI Language/zh_CN",
+];
+
+const uaProfile = new Map(); // host -> 被上游接受的 UA
+
+function uaFor(target) {
+  const host = hostOfUrl(target) || String(target || "");
+  return uaProfile.get(host) || UA;
+}
+
+function isUaForbidden(status, text) {
+  return (
+    Number(status) === 403 && /"reason"\s*:\s*"ua"/i.test(String(text || ""))
+  );
+}
+
+/**
+ * 发请求时自动挑 UA：遇到 "reason":"ua" 就换下一个候选，成功的那条记住。
+ * 返回第一次"非 UA 拦截"的响应，以及实际用到的 UA。
+ */
+async function fetchWithUaFallback(target, headers, timeoutMs) {
+  const host = hostOfUrl(target) || "";
+  const preferred = uaProfile.get(host);
+  const order = [preferred, ...UA_CANDIDATES.filter((ua) => ua !== preferred)]
+    .filter(Boolean);
+  let last = null;
+  for (const ua of order) {
+    const response = await fetchWithTimeout(
+      target,
+      { headers: { ...headers, "User-Agent": ua } },
+      timeoutMs
+    );
+    if (!response.ok && response.status === 403) {
+      const text = await response.clone().text().catch(() => "");
+      if (isUaForbidden(response.status, text)) {
+        last = response;
+        continue;
+      }
+    }
+    if (response.ok || response.status !== 403) {
+      if (host) uaProfile.set(host, ua);
+    }
+    return { response, ua };
+  }
+  return { response: last, ua: order[order.length - 1] || UA };
+}
+
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -520,7 +575,7 @@ function nativeUpstream(api, site, source = "spider") {
     source,
     api: normalizeBase(api || DEFAULT_API),
     site: normalizeBase(site || DEFAULT_SITE),
-    mirrors: [],
+    mirrors: [...DEFAULT_MIRRORS],
   };
 }
 
@@ -1246,7 +1301,7 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
     const start = Date.now();
     let status = null;
     try {
-      const response = await fetchWithTimeout(target, { headers }, timeoutMs);
+      const { response } = await fetchWithUaFallback(target, headers, timeoutMs);
       status = response.status;
       const text = await response.text();
       const ms = Date.now() - start;
@@ -1636,11 +1691,10 @@ async function fetchPageStream(upstream, pageUrl, ep, timeoutMs) {
 
 async function fetchOnePageStream(upstream, pageUrl, ep, timeoutMs) {
   try {
-    const response = await fetchWithTimeout(
+    const { response } = await fetchWithUaFallback(
       pageUrl,
       {
         headers: {
-          "User-Agent": UA,
           Referer: `${originOf(pageUrl) || upstream.site}/`,
         },
       },
@@ -2911,6 +2965,35 @@ async function handleNetCheck(url, request, env, pool) {
     results.push(row);
   }
 
+  // 顺带把所有候选 UA 在 worker 列表接口上扫一遍，看它到底认哪个。
+  const uaProbe = [];
+  for (const ua of UA_CANDIDATES) {
+    const started = Date.now();
+    const row = { ua: ua.slice(0, 42) };
+    try {
+      const response = await fetchWithTimeout(
+        `${api}/api/category/ai-duanju?page=1&size=3&sort=latest`,
+        {
+          headers: {
+            "User-Agent": ua,
+            Accept: "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+          },
+        },
+        10000
+      );
+      row.status = response.status;
+      row.ms = Date.now() - started;
+      const text = await response.text();
+      row.snippet = String(text).replace(/\s+/g, " ").trim().slice(0, 140);
+    } catch (error) {
+      row.status = null;
+      row.ms = Date.now() - started;
+      row.error = String((error && error.message) || error).slice(0, 100);
+    }
+    uaProbe.push(row);
+  }
+
   return jsonResponse({
     code: 1,
     at: new Date().toISOString(),
@@ -2918,6 +3001,7 @@ async function handleNetCheck(url, request, env, pool) {
     site,
     mirrors: (native && native.mirrors) || [],
     results,
+    uaProbe,
   });
 }
 
@@ -4558,12 +4642,11 @@ async function sitePlayback(upstream, id, ep, env) {
   for (const base of bases) {
     const started = Date.now();
     try {
-      const response = await fetchWithTimeout(
+      const { response } = await fetchWithUaFallback(
         `${base}${path}`,
         {
           method: "POST",
           headers: {
-            "User-Agent": UA,
             "Content-Type": "application/json",
             Accept: "application/json, text/plain, */*",
             Referer: `${base}/video/${encodeURIComponent(id)}/ep-${encodeURIComponent(ep)}/`,
