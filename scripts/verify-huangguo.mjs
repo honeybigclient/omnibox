@@ -50,6 +50,14 @@ const SOURCES_JSON_URL =
 const SPIDER = `
 const API = 'https://native.test';
 const SITE = 'https://site.test';
+const HG_SECRET = 'test-secret-123';
+const HG_ORIGIN = 'https://test-origin.example';
+const HG_REFERER = 'https://test-origin.example/app/';
+const CATEGORIES = [
+  { type_id: 'ai-duanju', type_name: 'AI短剧' },
+  // { type_id: 'ai-huanlian', type_name: '换脸专区' },
+  { type_id: 'rank:hot', type_name: '热播榜' }
+];
 `;
 
 const CONFIG = JSON.stringify({
@@ -927,7 +935,20 @@ async function main() {
   const signedHeaders = capture.playHeaders || {};
   expect(Boolean(signedHeaders["X-HG-Sig"]), "worker play carries X-HG-Sig");
   expect(Boolean(signedHeaders["X-HG-Ts"]), "worker play carries X-HG-Ts");
-  expect(signedHeaders.Origin === "https://drdrdrrddrdr.github.io", "worker play origin");
+  expect(
+    signedHeaders.Origin === "https://test-origin.example",
+    "origin comes from the spider"
+  );
+  // 签名必须用脚本里的密钥算，密钥一换就能自动跟随。
+  const win = Number(signedHeaders["X-HG-Ts"]) / 300;
+  const expectSig = crypto
+    .createHmac("sha256", "test-secret-123")
+    .update(`${win}\n/api/play?url=12527&ep=1`)
+    .digest("hex");
+  expect(
+    String(signedHeaders["X-HG-Sig"]).toLowerCase() === expectSig,
+    "signature uses the parsed secret"
+  );
 
   // 6j2. 新版取址带 cdn 鉴权：必须强制走代理，并把 ak/av 带下去。
   path =

@@ -120,16 +120,19 @@ async function hmacHex(secret, message) {
 }
 
 /** 目标地址属于 Worker 时，返回带签名的一组请求头。 */
-async function hgSignedHeaders(target, apiBase, shift = 0) {
+async function hgSignedHeaders(target, apiBase, shift = 0, sign = null) {
   const base = String(apiBase || "").replace(/\/+$/, "");
   if (!base || !String(target).startsWith(base)) return null;
+  const secret = (sign && sign.secret) || HG_SECRET;
+  const origin = (sign && sign.origin) || HG_ORIGIN;
+  const referer = (sign && sign.referer) || HG_REFERER;
   const pathWithQuery = String(target).slice(base.length) || "/";
   const win = Math.floor(Date.now() / 1000 / HG_WINDOW_SECONDS) + shift;
   return {
-    Origin: HG_ORIGIN,
-    Referer: HG_REFERER,
+    Origin: origin,
+    Referer: referer,
     "X-HG-Ts": String(win * HG_WINDOW_SECONDS),
-    "X-HG-Sig": await hmacHex(HG_SECRET, `${win}\n${pathWithQuery}`),
+    "X-HG-Sig": await hmacHex(secret, `${win}\n${pathWithQuery}`),
   };
 }
 
@@ -203,9 +206,9 @@ const BOOTSTRAP_TTL_MS = 30 * 1000;
 const HUANGGUO_CLASSES = [
   { type_id: "ai-duanju", type_name: "AI短剧" },
   { type_id: "ai-manju", type_name: "AI漫剧" },
-  { type_id: "chigua:all", type_name: "吃瓜·全部" },
-  { type_id: "chigua:hot", type_name: "吃瓜·热门" },
-  { type_id: "chigua:ai", type_name: "吃瓜·AI原创" },
+  { type_id: "chigua", type_name: "吃瓜·全部" },
+  { type_id: "chigua:remen", type_name: "吃瓜·热门" },
+  { type_id: "chigua:yuanchuang", type_name: "吃瓜·AI原创" },
   { type_id: "rank:hot", type_name: "热播榜" },
   { type_id: "rank:recommend", type_name: "推荐榜" },
   { type_id: "rank:potential", type_name: "潜力榜" },
@@ -608,7 +611,7 @@ function envMirrors(env) {
     .filter((item) => /^https?:\/\//i.test(item));
 }
 
-function nativeUpstream(api, site, source = "spider") {
+function nativeUpstream(api, site, source = "spider", sign = null) {
   const key = "huangguo_web";
   return {
     key,
@@ -619,6 +622,7 @@ function nativeUpstream(api, site, source = "spider") {
     api: normalizeBase(api || DEFAULT_API),
     site: normalizeBase(site || DEFAULT_SITE),
     mirrors: [...DEFAULT_MIRRORS],
+    sign: sign || null,
   };
 }
 
@@ -667,6 +671,14 @@ function hydratePool(raw) {
         api: item.api ? normalizeBase(item.api) : "",
         site: normalizeBase(item.site),
         mirrors: Array.isArray(item.mirrors) ? item.mirrors : [],
+        sign:
+          item.sign && item.sign.secret
+            ? {
+                secret: String(item.sign.secret),
+                origin: String(item.sign.origin || ""),
+                referer: String(item.sign.referer || ""),
+              }
+            : null,
         searchable: item.searchable !== false,
       });
     } else {
@@ -692,19 +704,46 @@ function hydratePool(raw) {
     expiresAt: Number((raw && raw.expiresAt) || 0),
     upstreams,
     bySlug: new Map(upstreams.map((item) => [item.slug, item])),
+    classes: Array.isArray(raw && raw.classes) ? raw.classes : [],
   };
 }
 
 function parseSpiderConfig(text) {
-  const api = String(text || "").match(
-    /(?:const|let|var)\s+API\s*=\s*['"]([^'"]+)['"]/
-  )?.[1];
-  const site = String(text || "").match(
-    /(?:const|let|var)\s+SITE\s*=\s*['"]([^'"]+)['"]/
-  )?.[1];
+  const source = String(text || "");
+  // 去掉注释，避免把被注释掉的分类/常量也算进去。
+  const raw = source
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/(^|[^:])\/\/[^\n]*/g, "$1 ");
+
+  const pick = (name) =>
+    raw.match(
+      new RegExp(`(?:const|let|var)\\s+${name}\\s*=\\s*['"]([^'"]+)['"]`)
+    )?.[1] || "";
+
+  const api = pick("API");
+  const site = pick("SITE");
+
+  // Worker 反爬签名用到的三个常量（上游改密钥时这里会自动跟上）。
+  const sign = {
+    secret: pick("HG_SECRET"),
+    origin: pick("HG_ORIGIN"),
+    referer: pick("HG_REFERER"),
+  };
+
+  // 分类也照上游的来：换脸/魔改下线这类变动不用再改代码。
+  const classes = [];
+  const classRx =
+    /\{\s*type_id:\s*['"]([^'"]+)['"]\s*,\s*type_name:\s*['"]([^'"]+)['"]\s*\}/g;
+  let hit;
+  while ((hit = classRx.exec(raw)) && classes.length < 24) {
+    classes.push({ type_id: hit[1], type_name: hit[2] });
+  }
+
   return {
     api: normalizeBase(api || DEFAULT_API),
     site: normalizeBase(site || DEFAULT_SITE),
+    sign: sign.secret ? sign : null,
+    classes,
   };
 }
 
@@ -859,8 +898,11 @@ async function cachePutPool(pool) {
         api: item.api,
         site: item.site,
         endpoint: item.endpoint,
+        mirrors: item.mirrors,
+        sign: item.sign,
         searchable: item.searchable,
       })),
+      classes: pool.classes || [],
     });
     await caches.default.put(
       POOL_CACHE_URL,
@@ -915,9 +957,16 @@ async function refreshPool(env) {
       ]);
 
     let native = nativeUpstream(DEFAULT_API, DEFAULT_SITE, "builtin");
+    let spiderClasses = [];
     if (spiderResult.status === "fulfilled") {
       const parsedSpider = parseSpiderConfig(spiderResult.value);
-      native = nativeUpstream(parsedSpider.api, parsedSpider.site, "spider");
+      native = nativeUpstream(
+        parsedSpider.api,
+        parsedSpider.site,
+        "spider",
+        parsedSpider.sign
+      );
+      if (parsedSpider.classes.length) spiderClasses = parsedSpider.classes;
     } else {
       console.warn("读取黄果 spider 配置失败，沿用内置地址");
     }
@@ -984,6 +1033,7 @@ async function refreshPool(env) {
       updatedAt: Date.now(),
       expiresAt: Date.now() + poolTtl(env),
       upstreams: allUpstreams,
+      classes: spiderClasses,
     });
 
     // 保证至少有一个可用上游。
@@ -1348,7 +1398,12 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
       let response = null;
       let text = "";
       for (const shift of [0, -1, 1]) {
-        const signed = await hgSignedHeaders(target, upstream.api, shift);
+        const signed = await hgSignedHeaders(
+          target,
+          upstream.api,
+          shift,
+          upstream.sign
+        );
         const headers = signed ? { ...baseHeaders, ...signed } : baseHeaders;
         const attempt = await fetchWithUaFallback(target, headers, timeoutMs);
         response = attempt.response;
@@ -1356,6 +1411,15 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
         text = await response.text();
         if (status !== 403 || !signed) break;
         if (!/sig_missing|"ua"/i.test(text)) break;
+        // 一路都签不过去，多半是上游换密钥了：后台拉一次最新脚本，
+        // 下一个请求就能用上新常量（这里不阻塞当前请求）。
+        if (shift === 1) {
+          try {
+            void refreshPool(env);
+          } catch {
+            // 刷新失败就算了，下次请求继续用旧常量。
+          }
+        }
       }
       const ms = Date.now() - start;
 
@@ -2683,7 +2747,10 @@ async function handleList(url, pool, env) {
     return jsonResponse({
       code: 1,
       msg: "数据列表",
-      class: HUANGGUO_CLASSES,
+      class:
+        Array.isArray(pool.classes) && pool.classes.length
+          ? pool.classes
+          : HUANGGUO_CLASSES,
       list: [],
     });
   }
