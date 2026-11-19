@@ -2994,6 +2994,81 @@ async function handleNetCheck(url, request, env, pool) {
     uaProbe.push(row);
   }
 
+  // discover=1：翻站点自己的前端代码，看它到底调哪些接口、带哪些参数。
+  let discovery = null;
+  if (url.searchParams.get("discover") === "1") {
+    discovery = { html: null, scripts: [], apiPaths: [], probes: [] };
+    const fetchText = async (target, ua) => {
+      try {
+        const response = await fetchWithTimeout(
+          target,
+          { headers: { "User-Agent": ua || UA, Accept: "*/*" } },
+          8000
+        );
+        return { status: response.status, text: await response.text() };
+      } catch (error) {
+        return { status: null, text: "", error: String(error && error.message) };
+      }
+    };
+
+    const home = await fetchText(site);
+    discovery.html = { status: home.status, bytes: home.text.length };
+    const apiHits = new Set(
+      (home.text.match(/\/api\/[a-zA-Z0-9_\-/]+/g) || []).slice(0, 40)
+    );
+
+    // 页面里引用的 JS
+    const scripts = [];
+    const rx = /<script[^>]+src=["']([^"']+)["']/gi;
+    let match;
+    while ((match = rx.exec(home.text)) && scripts.length < 6) {
+      try {
+        scripts.push(new URL(match[1], site).toString());
+      } catch {
+        // 忽略坏的地址。
+      }
+    }
+    discovery.scripts = scripts;
+
+    for (const script of scripts.slice(0, 2)) {
+      const js = await fetchText(script);
+      if (!js.text) continue;
+      for (const hit of js.text.match(/\/api\/[a-zA-Z0-9_\-/]+/g) || []) {
+        apiHits.add(hit);
+      }
+      // 顺便找 fetch/axios 里连带的查询参数写法
+      const calls = js.text.match(
+        /\/api\/videos[^"'`]{0,120}/g
+      );
+      if (calls) {
+        discovery.probes.push(...calls.slice(0, 5));
+      }
+    }
+    discovery.apiPaths = [...apiHits].slice(0, 60);
+
+    // 拿几种可能的参数写法直接试，看哪个不被拒。
+    const candidates = [
+      `${site}/api/videos?page=1&limit=5`,
+      `${site}/api/videos?page=1&size=5`,
+      `${site}/api/videos?category=ai-duanju&page=1&size=5`,
+      `${site}/api/videos?cate=ai-duanju&page=1&size=5`,
+      `${site}/api/videos?type=ai-duanju&page=1&size=5`,
+      `${site}/api/category/ai-duanju?page=1&size=5`,
+    ];
+    const probeResults = [];
+    for (const target of candidates) {
+      const started = Date.now();
+      const res = await fetchText(target);
+      probeResults.push({
+        url: target.replace(site, ""),
+        status: res.status,
+        ms: Date.now() - started,
+        snippet: String(res.text || "").replace(/\s+/g, " ").trim().slice(0, 120),
+      });
+    }
+    discovery.probes = probeResults;
+  }
+
   return jsonResponse({
     code: 1,
     at: new Date().toISOString(),
@@ -3002,6 +3077,7 @@ async function handleNetCheck(url, request, env, pool) {
     mirrors: (native && native.mirrors) || [],
     results,
     uaProbe,
+    ...(discovery ? { discovery } : {}),
   });
 }
 
