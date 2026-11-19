@@ -1220,6 +1220,25 @@ async function main() {
   expect(result.body.list[1].source_key === "hg_alpha", "alpha source key");
   expect(result.body.list[1].source_name === "Alpha 资源", "alpha source name");
 
+  // 10b. 关键词屏蔽：命中「男同」这类关键词的条目在列表里直接消失。
+  path = "/huangguo/api.php/provide/vod/?ac=videolist&slug=huangguo&t=ai-duanju&pg=1";
+  result = await call(path);
+  expect(result.body.list.length === 1, "list has the item before blocking");
+  result = await call(path, { env: { HUANGGUO_BLOCK_KEYWORDS: "测试短剧" } });
+  await show("10b. 关键词屏蔽（列表）", path, result);
+  expect(result.body.list.length === 0, "blocked keyword hides list item");
+
+  // 10c. 详情同样挡住。
+  path = "/huangguo/api.php/provide/vod/?ac=detail&ids=12527";
+  result = await call(path, { env: { HUANGGUO_BLOCK_KEYWORDS: "测试短剧" } });
+  await show("10c. 关键词屏蔽（详情）", path, result);
+  expect(result.body.msg === "该内容已被屏蔽", "blocked keyword hides detail");
+
+  // 10d. 默认就带「男同」关键词，不用配环境变量。
+  path = "/huangguo/api.php/provide/vod/?ac=detail&ids=12527";
+  result = await call(path);
+  expect(result.body.list.length === 1, "normal detail still visible");
+
   // 11. 确实没有内容：code 1 + 没有找到内容。
   path = "/huangguo/api.php/provide/vod/?ac=detail&ids=alpha~9999";
   result = await call(path);

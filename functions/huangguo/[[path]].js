@@ -1498,6 +1498,59 @@ async function requestUpstreamJson(upstream, url, env, options = {}) {
 /* 数据归一化                                                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * 内容屏蔽：命中关键词的条目在列表、搜索、详情里都直接隐藏。
+ * 默认挡「男同」相关内容，关键词可以用环境变量 HUANGGUO_BLOCK_KEYWORDS 覆盖
+ * （逗号分隔），设成空字符串则关闭屏蔽。
+ */
+const DEFAULT_BLOCK_KEYWORDS = ["男同", "耽美", "gay", "bl"];
+
+function blockKeywords(env) {
+  const raw = env && env.HUANGGUO_BLOCK_KEYWORDS;
+  if (raw === undefined || raw === null) return DEFAULT_BLOCK_KEYWORDS;
+  return String(raw)
+    .split(",")
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function matchesBlockKeyword(text, keyword) {
+  const haystack = String(text || "").toLowerCase();
+  if (!haystack) return false;
+  if (!keyword) return false;
+  // 英文短词（bl / gay）按词边界匹配，避免撞到别的单词。
+  if (/^[a-z]+$/.test(keyword)) {
+    const rx = new RegExp(
+      `(^|[^a-z])${keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^a-z]|$)`,
+      "i"
+    );
+    return rx.test(haystack);
+  }
+  return haystack.includes(keyword);
+}
+
+function isBlockedVod(vod, env) {
+  const keywords = blockKeywords(env);
+  if (!keywords.length) return false;
+  const text = [
+    vod && vod.vod_name,
+    vod && vod.type_name,
+    vod && vod.vod_remarks,
+    vod && vod.vod_content,
+    Array.isArray(vod && vod.vod_tag) ? vod.vod_tag.join(" ") : vod && vod.vod_tag,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return keywords.some((keyword) => matchesBlockKeyword(text, keyword));
+}
+
+function filterBlockedVods(list, env) {
+  if (!Array.isArray(list) || !list.length) return list;
+  const keywords = blockKeywords(env);
+  if (!keywords.length) return list;
+  return list.filter((item) => !isBlockedVod(item, env));
+}
+
 function proxyPicture(origin, upstream, value) {
   let pic = String(value || "").trim();
   if (!pic) return "";
@@ -2837,7 +2890,10 @@ async function handleDetailList(url, pool, env) {
         } else {
           result = await maccmsSearch(upstream, keyword, origin, env);
         }
-        const list = result.list.map((item) => decorateSearchItem(item, upstream));
+        const list = filterBlockedVods(
+          result.list.map((item) => decorateSearchItem(item, upstream)),
+          env
+        );
         const payload = {
           code: 1,
           msg: "数据列表",
@@ -2929,14 +2985,15 @@ async function handleDetailList(url, pool, env) {
     } else {
       result = await maccmsList(upstream, typeId, page, origin, env);
     }
+    const visibleList = filterBlockedVods(result.list, env);
     const payload = {
       code: 1,
       msg: "数据列表",
       page,
       pagecount: result.pageCount,
-      limit: result.list.length,
-      total: result.list.length,
-      list: result.list,
+      limit: visibleList.length,
+      total: visibleList.length,
+      list: visibleList,
     };
     await writeStaleCache(
       staleCacheKey("list", upstream.slug, [typeId || "default", page]),
@@ -2987,6 +3044,18 @@ async function handleDetail(url, pool, env) {
       result = await siteDetail(upstream, parsed.firstId, url.origin, env);
     } else {
       result = await maccmsDetail(upstream, parsed.ids, url.origin, env);
+    }
+
+    if (result.vod && isBlockedVod(result.vod, env)) {
+      return jsonResponse({
+        code: 1,
+        msg: "该内容已被屏蔽",
+        page: 1,
+        pagecount: 0,
+        limit: 0,
+        total: 0,
+        list: [],
+      });
     }
 
     if (result.status === "not_found") {
