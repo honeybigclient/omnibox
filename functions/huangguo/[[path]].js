@@ -1858,7 +1858,13 @@ async function resolveNativePlay(upstream, id, ep, env, pageHint, budgetMs) {
     const playback = await sitePlayback(upstream, id, ep, env);
     if (isHttpUrl(playback.url)) {
       attempts.push({ step: "site-playback", ok: true, status: playback.status });
-      return { url: playback.url, attempts, preferDirect: true };
+      // payload 里带着 CDN 鉴权（authKey/authValue），handlePlay 要靠它决定是否强制走代理。
+      return {
+        url: playback.url,
+        attempts,
+        preferDirect: true,
+        payload: playback.payload,
+      };
     }
     attempts.push({
       step: "site-playback",
@@ -3738,9 +3744,19 @@ async function verifyProxySrc(url, request, env) {
   return diff === 0;
 }
 
-async function streamProxyUrl(origin, src, referer, env) {
+/** 取址返回里的 CDN 鉴权：{"authKey":"x-cdn-auth","authValue":"..."}。 */
+function authHeadersOf(extra) {
+  if (!extra || !extra.authKey || !extra.authValue) return {};
+  return { [String(extra.authKey)]: String(extra.authValue) };
+}
+
+async function streamProxyUrl(origin, src, referer, env, extra) {
   const params = new URLSearchParams({ src: String(src) });
   if (referer) params.set("ref", String(referer));
+  if (extra && extra.authKey && extra.authValue) {
+    params.set("ak", String(extra.authKey));
+    params.set("av", String(extra.authValue));
+  }
   params.set("sig", await signProxySrc(String(src), env));
   return `${origin}/huangguo/hls?${params.toString()}`;
 }
@@ -3771,7 +3787,7 @@ function isPlaylistResponse(response, sourceUrl) {
  * 代理地址只接受 http(s) src，且不携带任何用户凭据，避免被当成开放代理滥用。
  */
 
-async function rewritePlaylist(text, sourceUrl, origin, referer, env) {
+async function rewritePlaylist(text, sourceUrl, origin, referer, env, extra) {
   // 关键：ticket 是按"取清单的那个出口 IP"绑定的。清单既然是我们 Worker 取的，
   // 那 key / 分片也必须由我们 Worker 去取，否则浏览器拿着 Worker 的 ticket 会被
   // CDN 回一个 200 + 空 body（表现就是 hls.js 解不了密、无限转圈）。
@@ -3793,7 +3809,7 @@ async function rewritePlaylist(text, sourceUrl, origin, referer, env) {
     } catch {
       return absUrl;
     }
-    return streamProxyUrl(origin, absUrl, referer, env);
+    return streamProxyUrl(origin, absUrl, referer, env, extra);
   };
 
   const lines = text.split(/\r?\n/);
@@ -3835,6 +3851,8 @@ async function replaceAsync(input, pattern, replacer) {
 async function handleStream(url, request, env) {
   const src = String(url.searchParams.get("src") || "").trim();
   const ref = String(url.searchParams.get("ref") || "").trim();
+  const ak = String(url.searchParams.get("ak") || "").trim();
+  const av = String(url.searchParams.get("av") || "").trim();
 
   if (!isHttpUrl(src)) {
     return jsonResponse({ error: "缺少有效的播放地址" }, 400);
@@ -3859,6 +3877,8 @@ async function handleStream(url, request, env) {
     "User-Agent": UA,
     Referer: referer,
     Accept: "*/*",
+    // 新版 CDN 要求带鉴权头，否则 m3u8 能取到、AES key 却取不到（keyLoadError）。
+    ...(ak && av ? { [ak]: av } : {}),
   };
   const range = request && request.headers ? request.headers.get("range") : null;
   if (range) headers.Range = range;
@@ -3894,7 +3914,10 @@ async function handleStream(url, request, env) {
     if (!text.trimStart().startsWith("#EXTM3U")) {
       return jsonResponse({ error: "上游返回的不是 m3u8", src }, 502);
     }
-    const rewritten = await rewritePlaylist(text, src, url.origin, referer, env);
+    const rewritten = await rewritePlaylist(text, src, url.origin, referer, env, {
+      authKey: ak,
+      authValue: av,
+    });
     return new Response(rewritten, {
       headers: {
         ...CORS,
@@ -4271,11 +4294,25 @@ async function handlePlay(url, pool, env) {
         // Worker（机房 IP）只给 54s 预览。所以默认让浏览器直连，代理只做兜底：
         //   - 直连失败 → 前端带 proxy=1 重试，走 /huangguo/hls
         //   - 新站（huangguo.me）清单没有 CORS → preferDirect=false，直接代理
+        // 新版 CDN 的 AES key 要求带鉴权头，浏览器直连带不了头，
+        // 所以只要有鉴权就必须走代理，否则一定 keyLoadError。
+        const cdn = (result.payload && result.payload.cdn) || {};
+        const auth =
+          cdn.authKey && cdn.authValue
+            ? { authKey: cdn.authKey, authValue: cdn.authValue }
+            : null;
         const wantProxy =
+          Boolean(auth) ||
           /^(1|true|yes)$/i.test(String(url.searchParams.get("proxy") || "")) ||
           result.preferDirect === false;
         const location = wantProxy
-          ? await streamProxyUrl(url.origin, result.url, result.referer, env)
+          ? await streamProxyUrl(
+              url.origin,
+              result.url,
+              result.referer,
+              env,
+              auth || undefined
+            )
           : result.url;
         attempts.push({
           step: `${candidate.slug}-route`,
