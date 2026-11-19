@@ -2852,6 +2852,75 @@ async function handleSignProxy(url, request, env) {
   });
 }
 
+/**
+ * 边缘自检：从 Cloudflare 这边去看各个上游到底返回什么。
+ * 国内网络被污染/封锁时，本地怎么测都是超时，只有边缘的视角才有参考价值。
+ * 只给管理员用。
+ */
+async function handleNetCheck(url, request, env, pool) {
+  const access = await checkAccess(request, env);
+  if (!access.ok) {
+    return jsonResponse({ error: access.error || "无权限" }, access.status || 403);
+  }
+
+  const native = (pool && pool.upstreams || []).find((item) => item.kind === "huangguo");
+  const targets = [];
+  const push = (label, target) => {
+    if (target && !targets.some((item) => item.url === target)) {
+      targets.push({ label, url: target });
+    }
+  };
+
+  const api = (native && native.api) || DEFAULT_API;
+  const site = (native && native.site) || DEFAULT_SITE;
+  push("worker 根路径", api);
+  push("worker 列表", `${api}/api/category/ai-duanju?page=1&size=5&sort=latest`);
+  push("站点根路径", site);
+  push("站点列表", `${site}/api/videos?category=ai-duanju&page=1&size=5`);
+  for (const mirror of (native && native.mirrors) || []) {
+    push(`镜像 ${hostOfUrl(mirror)}`, mirror);
+  }
+  push("新站", HUANGGUO_ME);
+
+  const results = [];
+  for (const target of targets) {
+    const started = Date.now();
+    const row = { label: target.label, url: target.url };
+    try {
+      const response = await fetchWithTimeout(
+        target.url,
+        {
+          headers: {
+            "User-Agent": UA,
+            Accept: "application/json, text/html, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+          },
+        },
+        12000
+      );
+      row.status = response.status;
+      row.ms = Date.now() - started;
+      const text = await response.text();
+      row.bytes = text.length;
+      row.snippet = String(text).replace(/\s+/g, " ").trim().slice(0, 160);
+    } catch (error) {
+      row.status = null;
+      row.ms = Date.now() - started;
+      row.error = String((error && error.message) || error).slice(0, 120);
+    }
+    results.push(row);
+  }
+
+  return jsonResponse({
+    code: 1,
+    at: new Date().toISOString(),
+    api,
+    site,
+    mirrors: (native && native.mirrors) || [],
+    results,
+  });
+}
+
 async function handleUpstreams(url, pool, env) {
   const probe =
     /^(1|true|all|yes)$/i.test(String(url.searchParams.get("probe") || ""));
@@ -5106,6 +5175,10 @@ export async function onRequest(context) {
 
   if (ac === "list") {
     return handleList(url, pool, env);
+  }
+
+  if (ac === "netcheck") {
+    return handleNetCheck(url, request, env, pool);
   }
 
   if (ac === "signproxy") {
