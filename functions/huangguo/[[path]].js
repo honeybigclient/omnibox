@@ -3090,13 +3090,20 @@ async function handleNetCheck(url, request, env, pool) {
         },
         10000
       );
+      const body = await response.text();
+      let keys = [];
+      try {
+        const parsed = JSON.parse(body);
+        const data = (parsed && parsed.data) || {};
+        keys = Object.keys(data).slice(0, 12);
+      } catch {
+        keys = [];
+      }
       discovery.playback = {
         status: response.status,
         ms: Date.now() - started,
-        snippet: String(await response.text())
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 160),
+        dataKeys: keys,
+        snippet: String(body).replace(/\s+/g, " ").trim().slice(0, 700),
       };
     } catch (error) {
       discovery.playback = {
@@ -4791,7 +4798,15 @@ async function sitePlayback(upstream, id, ep, env) {
       }
       const payload = (data && data.data) || {};
       const streams = payload.streams || {};
-      const url = String(streams.main || streams.hevc || "").trim();
+      let url = String(streams.main || streams.hevc || "").trim();
+
+      // 取址接口的返回结构改过好几次（streams.main → 别处），
+      // 兜底：在整个响应里找第一个 m3u8 / mp4，找不到才算失败。
+      if (!isHttpUrl(url)) {
+        const found = deepFindMediaUrl(payload) || deepFindMediaUrl(data);
+        if (found) url = String(found).trim();
+      }
+
       markSuccess(upstream, Date.now() - started);
       rememberSiteBase(upstream, base);
       return {
