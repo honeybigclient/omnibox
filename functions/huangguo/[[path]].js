@@ -359,8 +359,15 @@ function errorMessage(error) {
   switch (error.kind) {
     case "timeout":
       return `上游「${name}」请求超时（${error.ms}ms）`;
-    case "http":
-      return `上游「${name}」返回 HTTP ${error.status}${error.ms ? `（${error.ms}ms）` : ""}`;
+    case "http": {
+      // message 里可能带着上游自己的报错（"HTTP 400（invalid size）"），
+      // 只显示状态码没法排查，把多出来的那段一起拼上。
+      const detail = String(error.message || "")
+        .replace(/^HTTP\s+\d+\s*/, "")
+        .trim();
+      const ms = error.ms ? `（${error.ms}ms）` : "";
+      return `上游「${name}」返回 HTTP ${error.status}${ms}${detail}`;
+    }
     case "parse":
       return `上游「${name}」响应解析失败（不是有效 JSON）`;
     case "network":
@@ -2545,6 +2552,49 @@ async function handleList(url, pool, env) {
   }
 }
 
+/**
+ * 上游故障兜底缓存。
+ *
+ * 站点三天两头抽风，整页变空白体验太差。这里把列表/搜索的成功结果在边缘缓存里
+ * 存一份；上游报错时用上一份顶上，并在 msg 里说明是缓存，避免让用户以为是新数据。
+ */
+const STALE_TTL_SECONDS = 12 * 60 * 60;
+
+function staleCacheKey(kind, slug, parts) {
+  const suffix = parts.map((item) => encodeURIComponent(String(item))).join("/");
+  return new Request(`https://hg-stale.internal/${kind}/${slug}/${suffix}`, {
+    method: "GET",
+  });
+}
+
+async function readStaleCache(key) {
+  try {
+    if (typeof caches === "undefined" || !caches.default) return null;
+    const hit = await caches.default.match(key);
+    if (!hit) return null;
+    return await hit.json();
+  } catch {
+    return null;
+  }
+}
+
+async function writeStaleCache(key, payload) {
+  try {
+    if (typeof caches === "undefined" || !caches.default) return;
+    await caches.default.put(
+      key,
+      new Response(JSON.stringify(payload), {
+        headers: {
+          "content-type": "application/json",
+          "cache-control": `public, max-age=${STALE_TTL_SECONDS}`,
+        },
+      })
+    );
+  } catch {
+    // 缓存写不进去不影响正常响应。
+  }
+}
+
 async function handleDetailList(url, pool, env) {
   const keyword = String(url.searchParams.get("wd") || "").trim();
   const origin = url.origin;
@@ -2573,7 +2623,7 @@ async function handleDetailList(url, pool, env) {
           result = await maccmsSearch(upstream, keyword, origin, env);
         }
         const list = result.list.map((item) => decorateSearchItem(item, upstream));
-        return jsonResponse({
+        const payload = {
           code: 1,
           msg: "数据列表",
           page: 1,
@@ -2584,12 +2634,28 @@ async function handleDetailList(url, pool, env) {
           ...(result.warnings && result.warnings.length
             ? { warnings: result.warnings }
             : {}),
-        });
+        };
+        await writeStaleCache(
+          staleCacheKey("search", upstream.slug, [keyword.toLowerCase()]),
+          payload
+        );
+        return jsonResponse(payload);
       } catch (error) {
         const err =
           error instanceof UpstreamError
             ? error
             : new UpstreamError(upstream, "upstream", String(error && error.message));
+        const stale = await readStaleCache(
+          staleCacheKey("search", upstream.slug, [keyword.toLowerCase()])
+        );
+        if (stale) {
+          return jsonResponse({
+            ...stale,
+            msg: `${stale.msg}（上游故障，显示的是缓存结果）`,
+            stale: true,
+            error: err.toJSON ? err.toJSON() : undefined,
+          });
+        }
         return errorResponse(err);
       }
     }
@@ -2648,7 +2714,7 @@ async function handleDetailList(url, pool, env) {
     } else {
       result = await maccmsList(upstream, typeId, page, origin, env);
     }
-    return jsonResponse({
+    const payload = {
       code: 1,
       msg: "数据列表",
       page,
@@ -2656,12 +2722,28 @@ async function handleDetailList(url, pool, env) {
       limit: result.list.length,
       total: result.list.length,
       list: result.list,
-    });
+    };
+    await writeStaleCache(
+      staleCacheKey("list", upstream.slug, [typeId || "default", page]),
+      payload
+    );
+    return jsonResponse(payload);
   } catch (error) {
     const err =
       error instanceof UpstreamError
         ? error
         : new UpstreamError(upstream, "upstream", String(error && error.message));
+    const stale = await readStaleCache(
+      staleCacheKey("list", upstream.slug, [typeId || "default", page])
+    );
+    if (stale) {
+      return jsonResponse({
+        ...stale,
+        msg: `${stale.msg}（上游故障，显示的是缓存内容）`,
+        stale: true,
+        error: err.toJSON ? err.toJSON() : undefined,
+      });
+    }
     return errorResponse(err);
   }
 }
@@ -2716,6 +2798,15 @@ async function handleDetail(url, pool, env) {
       vod_id: parsed.displayId,
       upstream_candidates: candidates,
     };
+    await writeStaleCache(staleCacheKey("detail", upstream.slug, [parsed.firstId]), {
+      code: 1,
+      msg: "数据列表",
+      page: 1,
+      pagecount: 1,
+      limit: 1,
+      total: 1,
+      list: [vod],
+    });
     return jsonResponse({
       code: 1,
       msg: "数据列表",
@@ -2730,6 +2821,17 @@ async function handleDetail(url, pool, env) {
       error instanceof UpstreamError
         ? error
         : new UpstreamError(upstream, "upstream", String(error && error.message));
+    const stale = await readStaleCache(
+      staleCacheKey("detail", upstream.slug, [parsed.firstId])
+    );
+    if (stale) {
+      return jsonResponse({
+        ...stale,
+        msg: `${stale.msg}（上游故障，显示的是缓存内容）`,
+        stale: true,
+        error: err.toJSON ? err.toJSON() : undefined,
+      });
+    }
     return errorResponse(err);
   }
 }
