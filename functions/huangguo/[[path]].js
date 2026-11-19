@@ -1531,6 +1531,8 @@ async function mapLimit(items, limit, mapper) {
 /* 原生黄果上游                                                                */
 /* -------------------------------------------------------------------------- */
 
+const siteListProfile = new Map(); // slug -> 可用的列表地址模板
+
 /** 记一下哪个 size/sort 组合被上游接受，下次直接用。 */
 const listProfile = new Map(); // slug -> { size, sort }
 
@@ -3048,12 +3050,14 @@ async function handleNetCheck(url, request, env, pool) {
 
     // 拿几种可能的参数写法直接试，看哪个不被拒。
     const candidates = [
-      `${site}/api/videos?page=1&limit=5`,
       `${site}/api/videos?page=1&size=5`,
-      `${site}/api/videos?category=ai-duanju&page=1&size=5`,
-      `${site}/api/videos?cate=ai-duanju&page=1&size=5`,
-      `${site}/api/videos?type=ai-duanju&page=1&size=5`,
-      `${site}/api/category/ai-duanju?page=1&size=5`,
+      `${site}/api/home`,
+      `${site}/api/videos/recommend?page=1&size=5`,
+      `${site}/api/videos/12`,
+      `${site}/api/search?q=${encodeURIComponent("时停手表")}&page=1&size=5`,
+      `${site}/api/search/${encodeURIComponent("时停手表")}?page=1&size=5`,
+      `${site}/api/videos?page=1&size=5&type_id=ai-duanju`,
+      `${site}/api/videos?page=1&size=5&category_id=ai-duanju`,
     ];
     const probeResults = [];
     for (const target of candidates) {
@@ -3067,6 +3071,39 @@ async function handleNetCheck(url, request, env, pool) {
       });
     }
     discovery.probes = probeResults;
+
+    // 播放取址接口单独试一次（POST）
+    try {
+      const started = Date.now();
+      const response = await fetchWithTimeout(
+        `${site}/api/videos/12/episodes/1/playback`,
+        {
+          method: "POST",
+          headers: {
+            "User-Agent": UA,
+            "Content-Type": "application/json",
+            Accept: "application/json, text/plain, */*",
+            Origin: site,
+            Referer: `${site}/video/12/ep-1/`,
+          },
+          body: "{}",
+        },
+        10000
+      );
+      discovery.playback = {
+        status: response.status,
+        ms: Date.now() - started,
+        snippet: String(await response.text())
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 160),
+      };
+    } catch (error) {
+      discovery.playback = {
+        status: null,
+        error: String((error && error.message) || error).slice(0, 100),
+      };
+    }
   }
 
   return jsonResponse({
@@ -4788,18 +4825,43 @@ async function sitePlayback(upstream, id, ep, env) {
  * /api/videos?sort=hot，保证每项都能点进去。
  */
 async function siteList(upstream, typeId, page, origin, env) {
-  const size = 50;
+  const size = 30;
   const isRank = String(typeId || "").startsWith("rank:");
-  const target = isRank
-    ? `${upstream.site}/api/videos?sort=hot&page=${page}&size=${size}`
-    : `${upstream.site}/api/videos?category=${encodeURIComponent(
-        typeId || "ai-duanju"
-      )}&page=${page}&size=${size}&sort=latest`;
 
-  const { data } = await requestUpstreamJson(upstream, target, env, {
-    timeoutMs: 9000,
-    bypassBreaker: true,
-  });
+  // 站点 2026-11 起 /api/videos 不再接受 category 参数（带上就 400「请求参数无效」），
+  // 所以先试最朴素的写法，再依次退化到旧写法。哪个通了记住。
+  const candidates = isRank
+    ? [
+        `${upstream.site}/api/videos?sort=hot&page=${page}&size=${size}`,
+        `${upstream.site}/api/videos?page=${page}&size=${size}`,
+      ]
+    : [
+        `${upstream.site}/api/videos?page=${page}&size=${size}`,
+        `${upstream.site}/api/videos?page=${page}&size=${size}&sort=latest`,
+        `${upstream.site}/api/videos?category=${encodeURIComponent(
+          typeId || "ai-duanju"
+        )}&page=${page}&size=${size}`,
+      ];
+
+  let data = null;
+  let lastError = null;
+  for (const target of candidates) {
+    try {
+      const result = await requestUpstreamJson(upstream, target, env, {
+        timeoutMs: 9000,
+        bypassBreaker: true,
+      });
+      data = result.data;
+      siteListProfile.set(upstream.slug, target.replace(/page=\d+/, "page=#"));
+      break;
+    } catch (error) {
+      lastError = error;
+      if (!(error instanceof UpstreamError)) throw error;
+      if (Number(error.status) !== 400) throw error;
+    }
+  }
+  if (!data) throw lastError || new UpstreamError(upstream, "upstream", "站点列表失败");
+
   const payload = (data && data.data) || {};
   const items = Array.isArray(payload.items) ? payload.items : [];
   return {
